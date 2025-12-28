@@ -1,0 +1,92 @@
+{
+    "log": {
+        "level": "info",
+        "access": null,
+        "error": null
+    },
+    "inbounds": [
+        {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "0.0.0.0:1080",
+            "settings": {
+                "auth": "noauth",
+                "udp": true
+            }
+        },
+        {
+            "tag": "http-in",
+            "protocol": "http",
+            "listen": "127.0.0.1:1081",
+            "settings": {
+                "auth": null
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "direct",
+            "protocol": "direct",
+            "settings": null,
+            "transport": null
+        },
+        {
+            "tag": "proxy",
+            "protocol": "vmess",
+            "settings": {
+                "uuid": "12c5e7dd-eaa7-4885-b53c-161f73a3da55",
+                "security": "auto",
+                "alter_id": 0
+            },
+            "transport": {
+                "address": "www.tatsoft.top",
+                "port": 5463,
+                "transport_type": "websocket",
+                "tcp_settings": null,
+                "ws_settings": {
+                    "path": "/tpznHCYhVG",
+                    "headers": {}
+                },
+                "tls_settings": {
+                    "enabled": true,
+                    "server_name": "www.nas-pass.sbs",
+                    "allow_insecure": false,
+                    "certificate_file": null,
+                    "key_file": null
+                }
+            }
+        }
+    ],
+    "routing": {
+        "domain_strategy": "AsIs",
+        "rules": [
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:google",
+                    "geosite:github",
+                    "geosite:openai"
+                ],
+                "outbound_tag": "proxy"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:cn",
+                    "geosite:private"
+                ],
+                "outbound_tag": "direct"
+            },
+            {
+                "type": "field",
+                "ip": [
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "127.0.0.0/8"
+                ],
+                "outbound_tag": "direct"
+            }
+        ]
+    }
+}

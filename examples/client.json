@@ -1,0 +1,83 @@
+{
+    "log": {
+        "level": "info",
+        "access": null,
+        "error": null
+    },
+    "inbounds": [
+        {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1:1080",
+            "settings": {
+                "auth": "noauth",
+                "udp": true
+            },
+            "transport": null
+        },
+        {
+            "tag": "http-in",
+            "protocol": "http",
+            "listen": "127.0.0.1:8080",
+            "settings": {
+                "auth": null
+            },
+            "transport": null
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "proxy",
+            "protocol": "vmess",
+            "settings": {
+                "uuid": "your-uuid-here",
+                "security": "auto",
+                "alter_id": 0
+            },
+            "transport": {
+                "address": "your-server.com",
+                "port": 443,
+                "transport_type": "websocket",
+                "tcp_settings": null,
+                "ws_settings": {
+                    "path": "/ws",
+                    "headers": {}
+                },
+                "tls_settings": {
+                    "enabled": true,
+                    "server_name": "your-server.com",
+                    "allow_insecure": false,
+                    "certificate_file": null,
+                    "key_file": null
+                }
+            }
+        },
+        {
+            "tag": "direct",
+            "protocol": "direct",
+            "settings": null,
+            "transport": null
+        }
+    ],
+    "routing": {
+        "domain_strategy": "AsIs",
+        "rules": [
+            {
+                "type": "chinasites",
+                "outbound_tag": "direct"
+            },
+            {
+                "type": "chinaip",
+                "outbound_tag": "direct"
+            },
+            {
+                "type": "privateip",
+                "outbound_tag": "direct"
+            },
+            {
+                "type": "all",
+                "outbound_tag": "proxy"
+            }
+        ]
+    }
+}
