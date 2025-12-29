@@ -9,7 +9,9 @@
 
 pub mod rule_router;
 
-pub use rule_router::RuleRouter;
+pub use rule_router::{Rule, RuleRouter, RuleStatsSnapshot, RuleType};
+
+use std::any::Any;
 
 use crate::common::Metadata;
 
@@ -22,6 +24,9 @@ pub trait Router: Send + Sync {
     ///
     /// This is a pure function - no IO, no side effects.
     fn select(&self, metadata: &Metadata) -> &str;
+
+    /// For downcasting to concrete types (e.g., to access stats)
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Simple router that always returns the same outbound
@@ -40,6 +45,10 @@ impl StaticRouter {
 impl Router for StaticRouter {
     fn select(&self, _metadata: &Metadata) -> &str {
         &self.outbound
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

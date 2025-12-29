@@ -107,6 +107,8 @@ pub struct Runtime {
     inbounds: Vec<Arc<InboundStack>>,
     dispatcher: Arc<Dispatcher>,
     shutdown_tx: broadcast::Sender<()>,
+    /// Router for statistics access (only RuleRouter supports stats)
+    router: Arc<dyn Router>,
 }
 
 impl Runtime {
@@ -147,7 +149,7 @@ impl Runtime {
         };
 
         // Build dispatcher
-        let dispatcher = Arc::new(Dispatcher::new(router, outbounds));
+        let dispatcher = Arc::new(Dispatcher::new(router.clone(), outbounds));
 
         // Build inbounds
         let mut inbounds = Vec::new();
@@ -160,6 +162,7 @@ impl Runtime {
             inbounds,
             dispatcher,
             shutdown_tx,
+            router,
         })
     }
 
@@ -324,9 +327,19 @@ impl Runtime {
 
         info!("Runtime started with {} inbounds", self.inbounds.len());
 
-        // Wait for shutdown signal
+        // Start stats reporter task
+        let router_for_stats = self.router.clone();
+        let mut stats_shutdown_rx = self.shutdown_tx.subscribe();
+        let stats_handle = tokio::spawn(async move {
+            Self::stats_reporter(router_for_stats, &mut stats_shutdown_rx).await;
+        });
+
+        // Wait for shutdown signal (Ctrl+C)
         tokio::signal::ctrl_c().await?;
         info!("Shutting down...");
+
+        // Log final stats before shutdown
+        self.log_router_stats();
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());
@@ -335,8 +348,68 @@ impl Runtime {
         for handle in handles {
             let _ = handle.await;
         }
+        let _ = stats_handle.await;
 
         Ok(())
+    }
+
+    /// Stats reporter task - logs stats periodically and on SIGUSR1 signal
+    #[cfg(unix)]
+    async fn stats_reporter(router: Arc<dyn Router>, shutdown_rx: &mut broadcast::Receiver<()>) {
+        // Stats interval: 1 minutes
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Setup SIGUSR1 signal handler
+        let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+            .expect("Failed to setup SIGUSR1 handler");
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    Self::log_stats_from_router(&router);
+                }
+                _ = sigusr1.recv() => {
+                    info!("Received SIGUSR1, printing routing statistics...");
+                    Self::log_stats_from_router(&router);
+                }
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Stats reporter task - logs stats periodically (non-Unix)
+    #[cfg(not(unix))]
+    async fn stats_reporter(router: Arc<dyn Router>, shutdown_rx: &mut broadcast::Receiver<()>) {
+        // Stats interval: 5 minutes
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    Self::log_stats_from_router(&router);
+                }
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Log routing statistics
+    fn log_router_stats(&self) {
+        Self::log_stats_from_router(&self.router);
+    }
+
+    /// Log stats from a router reference
+    fn log_stats_from_router(router: &Arc<dyn Router>) {
+        // Try to downcast to RuleRouter to access stats
+        if let Some(rule_router) = router.as_any().downcast_ref::<RuleRouter>() {
+            rule_router.log_stats();
+        }
     }
 }
 

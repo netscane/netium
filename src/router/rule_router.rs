@@ -1,6 +1,9 @@
 //! Rule-based Router implementation
 
+use std::any::Any;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::common::{Address, Metadata, Network};
 use crate::geoip::GeoIpMatcher;
@@ -58,21 +61,62 @@ pub struct Rule {
     pub outbound_tag: String,
 }
 
+/// Statistics for a single rule
+#[derive(Debug)]
+pub struct RuleStat {
+    /// Number of times this rule was hit
+    pub hits: AtomicU64,
+}
+
+impl Default for RuleStat {
+    fn default() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Clone for RuleStat {
+    fn clone(&self) -> Self {
+        Self {
+            hits: AtomicU64::new(self.hits.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Snapshot of rule statistics for reporting
+#[derive(Debug, Clone)]
+pub struct RuleStatsSnapshot {
+    /// Rule description (type + outbound)
+    pub rule_desc: String,
+    /// Number of hits
+    pub hits: u64,
+    /// Percentage of total hits
+    pub percent: f64,
+}
+
 /// Rule-based router
 pub struct RuleRouter {
     rules: Vec<Rule>,
     default_outbound: String,
     geosite: GeoSiteMatcher,
     geoip: GeoIpMatcher,
+    /// Statistics for each rule (same index as rules)
+    stats: Arc<Vec<RuleStat>>,
+    /// Hits for default outbound (no rule matched)
+    default_hits: Arc<AtomicU64>,
 }
 
 impl RuleRouter {
     pub fn new(rules: Vec<Rule>, default_outbound: impl Into<String>) -> Self {
+        let stats: Vec<RuleStat> = rules.iter().map(|_| RuleStat::default()).collect();
         Self {
             rules,
             default_outbound: default_outbound.into(),
             geosite: GeoSiteMatcher::new(),
             geoip: GeoIpMatcher::default(),
+            stats: Arc::new(stats),
+            default_hits: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -84,6 +128,89 @@ impl RuleRouter {
     pub fn with_geoip(mut self, geoip: GeoIpMatcher) -> Self {
         self.geoip = geoip;
         self
+    }
+
+    /// Get statistics snapshot for all rules
+    pub fn get_stats(&self) -> Vec<RuleStatsSnapshot> {
+        let total: u64 = self.stats.iter()
+            .map(|s| s.hits.load(Ordering::Relaxed))
+            .sum::<u64>()
+            + self.default_hits.load(Ordering::Relaxed);
+
+        let mut result = Vec::with_capacity(self.rules.len() + 1);
+
+        for (i, rule) in self.rules.iter().enumerate() {
+            let hits = self.stats[i].hits.load(Ordering::Relaxed);
+            let percent = if total > 0 {
+                (hits as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let rule_desc = format!("{:?} -> {}", rule.rule_type, rule.outbound_tag);
+            result.push(RuleStatsSnapshot {
+                rule_desc,
+                hits,
+                percent,
+            });
+        }
+
+        // Add default outbound stats
+        let default_hits = self.default_hits.load(Ordering::Relaxed);
+        let default_percent = if total > 0 {
+            (default_hits as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        result.push(RuleStatsSnapshot {
+            rule_desc: format!("default -> {}", self.default_outbound),
+            hits: default_hits,
+            percent: default_percent,
+        });
+
+        result
+    }
+
+    /// Get total number of routing decisions made
+    pub fn total_hits(&self) -> u64 {
+        self.stats.iter()
+            .map(|s| s.hits.load(Ordering::Relaxed))
+            .sum::<u64>()
+            + self.default_hits.load(Ordering::Relaxed)
+    }
+
+    /// Reset all statistics
+    pub fn reset_stats(&self) {
+        for stat in self.stats.iter() {
+            stat.hits.store(0, Ordering::Relaxed);
+        }
+        self.default_hits.store(0, Ordering::Relaxed);
+    }
+
+    /// Print statistics to log
+    pub fn log_stats(&self) {
+        let stats = self.get_stats();
+        let total = self.total_hits();
+        
+        tracing::info!("=== Routing Statistics (total: {}) ===", total);
+        for (i, stat) in stats.iter().enumerate() {
+            if i < self.rules.len() {
+                tracing::info!(
+                    "  Rule {}: {} | hits: {} ({:.2}%)",
+                    i + 1,
+                    stat.rule_desc,
+                    stat.hits,
+                    stat.percent
+                );
+            } else {
+                tracing::info!(
+                    "  Default: {} | hits: {} ({:.2}%)",
+                    stat.rule_desc,
+                    stat.hits,
+                    stat.percent
+                );
+            }
+        }
     }
 
     /// Check if a rule matches the metadata
@@ -117,7 +244,10 @@ impl RuleRouter {
             RuleType::All => return true,
             RuleType::ChinaSites => {
                 if let Address::Domain(domain, _) = &metadata.destination {
-                    return self.geosite.matches("cn", domain);
+                    // Use geosite cn and geolocation-cn categories with suffix matching
+                    // This treats Full entries as Domain entries (suffix match)
+                    // so that subdomains like api.bilibili.com match bilibili.com
+                    return self.geosite.is_china_domain(domain);
                 }
                 return false;
             }
@@ -285,13 +415,21 @@ impl RuleRouter {
 
 impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
-        for rule in &self.rules {
+        for (i, rule) in self.rules.iter().enumerate() {
             if self.match_rule(rule, metadata) {
+                // Record hit
+                self.stats[i].hits.fetch_add(1, Ordering::Relaxed);
                 return &rule.outbound_tag;
             }
         }
 
+        // Record default hit
+        self.default_hits.fetch_add(1, Ordering::Relaxed);
         &self.default_outbound
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -302,6 +440,8 @@ impl Default for RuleRouter {
             default_outbound: "direct".to_string(),
             geosite: GeoSiteMatcher::new(),
             geoip: GeoIpMatcher::new(),
+            stats: Arc::new(vec![]),
+            default_hits: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -349,5 +489,54 @@ mod tests {
 
         let meta2 = Metadata::new(Address::domain("example.com", 80));
         assert_eq!(router.select(&meta2), "direct");
+    }
+
+    #[test]
+    fn test_rule_stats() {
+        let rules = vec![
+            Rule {
+                rule_type: RuleType::Field,
+                domain: vec!["domain:google.com".to_string()],
+                outbound_tag: "proxy".to_string(),
+                ..Default::default()
+            },
+            Rule {
+                rule_type: RuleType::All,
+                outbound_tag: "direct".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let router = RuleRouter::new(rules, "fallback");
+
+        // Simulate traffic
+        for _ in 0..3 {
+            router.select(&Metadata::new(Address::domain("www.google.com", 443)));
+        }
+        for _ in 0..7 {
+            router.select(&Metadata::new(Address::domain("example.com", 80)));
+        }
+
+        // Check stats
+        let stats = router.get_stats();
+        assert_eq!(stats.len(), 3); // 2 rules + default
+
+        // Rule 1 (google.com -> proxy): 3 hits, 30%
+        assert_eq!(stats[0].hits, 3);
+        assert!((stats[0].percent - 30.0).abs() < 0.1);
+
+        // Rule 2 (all -> direct): 7 hits, 70%
+        assert_eq!(stats[1].hits, 7);
+        assert!((stats[1].percent - 70.0).abs() < 0.1);
+
+        // Default: 0 hits
+        assert_eq!(stats[2].hits, 0);
+
+        // Total
+        assert_eq!(router.total_hits(), 10);
+
+        // Reset
+        router.reset_stats();
+        assert_eq!(router.total_hits(), 0);
     }
 }

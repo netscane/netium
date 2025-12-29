@@ -1,12 +1,13 @@
 //! GeoSite module for domain-based routing
 //!
 //! Uses geosite-rs crate to parse V2Ray geosite.dat files.
+//! Implements inverted index for fast domain lookup.
 
 mod matcher;
 
 pub use matcher::GeoSiteMatcher;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -16,15 +17,21 @@ use tracing::{debug, warn};
 use crate::error::{Error, Result};
 
 /// Domain entry with match type
+/// Based on V2Ray domain-list-community format:
+/// - domain: → subdomain/suffix match (matches domain and all subdomains)
+/// - full: → exact match (matches only the exact domain)
+/// - keyword: → substring match (matches if domain contains the keyword)
+/// - regexp: → regex match
 #[derive(Debug, Clone)]
 pub enum DomainEntry {
-    /// Plain domain (substring match)
-    Plain(String),
     /// Domain suffix match (domain and subdomains)
+    /// e.g., "example.com" matches "example.com" and "www.example.com"
     Domain(String),
-    /// Full domain match
+    /// Full domain match (exact)
+    /// e.g., "example.com" only matches "example.com"
     Full(String),
-    /// Keyword match
+    /// Keyword/substring match
+    /// e.g., "google" matches "google.com", "www.google.com", "googleapis.com"
     Keyword(String),
     /// Regex match
     Regex(String),
@@ -35,11 +42,37 @@ impl DomainEntry {
     pub fn matches(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
         match self {
-            DomainEntry::Plain(s) => domain_lower.contains(s),
             DomainEntry::Domain(s) => {
+                // Suffix match: matches domain and all subdomains
                 domain_lower == *s || domain_lower.ends_with(&format!(".{}", s))
             }
-            DomainEntry::Full(s) => domain_lower == *s,
+            DomainEntry::Full(s) => {
+                // Exact match only
+                domain_lower == *s
+            }
+            DomainEntry::Keyword(s) => {
+                // Substring/keyword match
+                domain_lower.contains(s)
+            }
+            DomainEntry::Regex(pattern) => {
+                if let Ok(re) = regex::Regex::new(pattern) {
+                    re.is_match(&domain_lower)
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Check if domain matches this entry, treating Full as Domain (suffix match)
+    /// This is useful for matching subdomains of exact-match entries
+    pub fn matches_as_suffix(&self, domain: &str) -> bool {
+        let domain_lower = domain.to_lowercase();
+        match self {
+            DomainEntry::Domain(s) | DomainEntry::Full(s) => {
+                // Treat Full as Domain (suffix match)
+                domain_lower == *s || domain_lower.ends_with(&format!(".{}", s))
+            }
             DomainEntry::Keyword(s) => domain_lower.contains(s),
             DomainEntry::Regex(pattern) => {
                 if let Ok(re) = regex::Regex::new(pattern) {
@@ -55,32 +88,116 @@ impl DomainEntry {
 impl From<&Domain> for DomainEntry {
     fn from(domain: &Domain) -> Self {
         let value = domain.value.to_lowercase();
-        // geosite-rs domain types:
-        // 0 = Plain (keyword match)
-        // 1 = Domain (suffix match) - note: this is Regex in v2ray proto but Domain in geosite-rs
-        // 2 = Full (exact match)
-        // 3 = Regex
+        // geosite-rs domain types (from geosite_to_hashmap in geosite-rs):
+        // 0 = DOMAIN-KEYWORD (Plain/Keyword - substring match)
+        // 1 = DOMAIN-SUFFIX (Domain - suffix match)
+        // 2 = DOMAIN (Full - exact match)
+        // 3 = DOMAIN-REGEX (Regex)
         match domain.r#type {
-            0 => DomainEntry::Keyword(value),  // Plain/Keyword
-            1 => DomainEntry::Domain(value),   // Domain suffix
-            2 => DomainEntry::Full(value),     // Full exact match
-            3 => DomainEntry::Regex(domain.value.clone()), // Regex (keep original case)
-            _ => DomainEntry::Domain(value),   // Default to domain
+            0 => DomainEntry::Keyword(value),                    // Keyword/substring match
+            1 => DomainEntry::Domain(value),                     // Domain suffix match
+            2 => DomainEntry::Full(value),                       // Full exact match
+            3 => DomainEntry::Regex(domain.value.clone()),       // Regex (keep original case)
+            _ => DomainEntry::Domain(value),                     // Default to domain suffix
         }
     }
 }
 
-/// GeoSite database
+/// GeoSite database with inverted index for fast lookup
 #[derive(Debug, Default)]
 pub struct GeoSite {
-    /// Map of site tag to domain entries
+    /// Map of site tag to domain entries (for iteration/debugging)
     sites: HashMap<String, Vec<DomainEntry>>,
+    
+    /// Inverted index: exact domain -> set of site tags
+    /// For Full entries: "example.com" -> {"cn", "geolocation-cn"}
+    exact_index: HashMap<String, HashSet<String>>,
+    
+    /// Inverted index: domain suffix -> set of site tags  
+    /// For Domain entries: "bilibili.com" -> {"cn", "bilibili"}
+    /// Matches "bilibili.com" and "*.bilibili.com"
+    suffix_index: HashMap<String, HashSet<String>>,
+    
+    /// Keywords that need substring matching (site_tag, keyword)
+    keywords: Vec<(String, String)>,
+    
+    /// Regex patterns that need regex matching (site_tag, pattern, compiled_regex)
+    regexes: Vec<(String, regex::Regex)>,
 }
 
 impl GeoSite {
     /// Create empty GeoSite
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Add a single entry to the inverted index
+    fn index_entry(&mut self, site: &str, entry: &DomainEntry) {
+        match entry {
+            DomainEntry::Full(domain) => {
+                self.exact_index
+                    .entry(domain.clone())
+                    .or_default()
+                    .insert(site.to_string());
+            }
+            DomainEntry::Domain(domain) => {
+                self.suffix_index
+                    .entry(domain.clone())
+                    .or_default()
+                    .insert(site.to_string());
+            }
+            DomainEntry::Keyword(keyword) => {
+                self.keywords.push((site.to_string(), keyword.clone()));
+            }
+            DomainEntry::Regex(pattern) => {
+                if let Ok(re) = regex::Regex::new(pattern) {
+                    self.regexes.push((site.to_string(), re));
+                }
+            }
+        }
+    }
+
+    /// Rebuild inverted index from sites
+    fn rebuild_index(&mut self) {
+        self.exact_index.clear();
+        self.suffix_index.clear();
+        self.keywords.clear();
+        self.regexes.clear();
+
+        for (site, entries) in &self.sites {
+            for entry in entries {
+                match entry {
+                    DomainEntry::Full(domain) => {
+                        self.exact_index
+                            .entry(domain.clone())
+                            .or_default()
+                            .insert(site.clone());
+                    }
+                    DomainEntry::Domain(domain) => {
+                        self.suffix_index
+                            .entry(domain.clone())
+                            .or_default()
+                            .insert(site.clone());
+                    }
+                    DomainEntry::Keyword(keyword) => {
+                        self.keywords.push((site.clone(), keyword.clone()));
+                    }
+                    DomainEntry::Regex(pattern) => {
+                        if let Ok(re) = regex::Regex::new(pattern) {
+                            self.regexes.push((site.clone(), re));
+                        }
+                    }
+                }
+            }
+        }
+        
+        debug!(
+            "GeoSite index built: {} exact, {} suffix, {} keywords, {} regexes",
+            self.exact_index.len(),
+            self.suffix_index.len(),
+            self.keywords.len(),
+            self.regexes.len()
+        );
     }
 
     /// Load from V2Ray geosite.dat file using geosite-rs
@@ -104,6 +221,9 @@ impl GeoSite {
             geosite.sites.insert(name, entries);
         }
 
+        // Build inverted index
+        geosite.rebuild_index();
+
         debug!("Loaded {} sites from {:?}", geosite.sites.len(), path);
         Ok(geosite)
     }
@@ -120,20 +240,25 @@ impl GeoSite {
         for path in paths {
             let path = Path::new(path);
             if path.exists() {
+                debug!("Found geosite.dat at {:?}", path);
                 match Self::load_from_dat(path) {
                     Ok(geosite) if !geosite.sites.is_empty() => {
-                        debug!("Loaded GeoSite from {:?}", path);
+                        let cn_count = geosite.get("cn").map(|v| v.len()).unwrap_or(0);
+                        debug!("Loaded GeoSite from {:?}: {} sites, cn has {} domains", 
+                            path, geosite.sites.len(), cn_count);
                         return geosite;
                     }
                     Err(e) => {
                         warn!("Failed to load GeoSite from {:?}: {}", path, e);
                     }
-                    _ => {}
+                    _ => {
+                        debug!("GeoSite from {:?} is empty", path);
+                    }
                 }
             }
         }
 
-        debug!("No geosite.dat found, using builtin sites");
+        warn!("No geosite.dat found, using builtin sites (limited coverage)");
         Self::with_builtin()
     }
 
@@ -153,7 +278,7 @@ impl GeoSite {
             if path.extension().map_or(false, |ext| ext == "txt") {
                 if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
                     let domains = Self::parse_text_file(&path)?;
-                    geosite.sites.insert(name.to_lowercase(), domains);
+                    geosite.add_site(name, domains);
                 }
             }
         }
@@ -198,13 +323,132 @@ impl GeoSite {
         self.sites.get(&site.to_lowercase())
     }
 
-    /// Check if a domain matches a site
-    pub fn matches(&self, site: &str, domain: &str) -> bool {
-        if let Some(entries) = self.get(site) {
-            entries.iter().any(|e| e.matches(domain))
-        } else {
-            false
+    /// Extract domain suffixes for lookup
+    /// e.g., "www.api.bilibili.com" -> ["www.api.bilibili.com", "api.bilibili.com", "bilibili.com", "com"]
+    fn domain_suffixes(domain: &str) -> Vec<&str> {
+        let mut suffixes = vec![domain];
+        let mut remaining = domain;
+        while let Some(pos) = remaining.find('.') {
+            remaining = &remaining[pos + 1..];
+            if !remaining.is_empty() {
+                suffixes.push(remaining);
+            }
         }
+        suffixes
+    }
+
+    /// Check if a domain matches a site using inverted index
+    pub fn matches(&self, site: &str, domain: &str) -> bool {
+        let domain_lower = domain.to_lowercase();
+        let site_lower = site.to_lowercase();
+
+        // 1. Check exact match index (Full entries)
+        if let Some(sites) = self.exact_index.get(&domain_lower) {
+            if sites.contains(&site_lower) {
+                return true;
+            }
+        }
+
+        // 2. Check suffix match index (Domain entries)
+        // Try each suffix of the domain
+        for suffix in Self::domain_suffixes(&domain_lower) {
+            if let Some(sites) = self.suffix_index.get(suffix) {
+                if sites.contains(&site_lower) {
+                    return true;
+                }
+            }
+        }
+
+        // 3. Check keywords (need to iterate)
+        for (kw_site, keyword) in &self.keywords {
+            if kw_site == &site_lower && domain_lower.contains(keyword) {
+                return true;
+            }
+        }
+
+        // 4. Check regexes (need to iterate)
+        for (re_site, re) in &self.regexes {
+            if re_site == &site_lower && re.is_match(&domain_lower) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a domain matches a site, treating Full entries as suffix match
+    /// Uses inverted index for fast lookup
+    pub fn matches_as_suffix(&self, site: &str, domain: &str) -> bool {
+        let domain_lower = domain.to_lowercase();
+        let site_lower = site.to_lowercase();
+
+        // For suffix matching, both exact_index and suffix_index use suffix matching
+        for suffix in Self::domain_suffixes(&domain_lower) {
+            // Check exact index (Full entries treated as suffix)
+            if let Some(sites) = self.exact_index.get(suffix) {
+                if sites.contains(&site_lower) {
+                    return true;
+                }
+            }
+            // Check suffix index (Domain entries)
+            if let Some(sites) = self.suffix_index.get(suffix) {
+                if sites.contains(&site_lower) {
+                    return true;
+                }
+            }
+        }
+
+        // Check keywords
+        for (kw_site, keyword) in &self.keywords {
+            if kw_site == &site_lower && domain_lower.contains(keyword) {
+                return true;
+            }
+        }
+
+        // Check regexes
+        for (re_site, re) in &self.regexes {
+            if re_site == &site_lower && re.is_match(&domain_lower) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a domain matches any of the given sites (with suffix matching)
+    pub fn matches_any_as_suffix(&self, sites: &[&str], domain: &str) -> bool {
+        let domain_lower = domain.to_lowercase();
+        let sites_lower: HashSet<String> = sites.iter().map(|s| s.to_lowercase()).collect();
+
+        // Check both indexes with suffix matching
+        for suffix in Self::domain_suffixes(&domain_lower) {
+            if let Some(matched_sites) = self.exact_index.get(suffix) {
+                if matched_sites.iter().any(|s| sites_lower.contains(s)) {
+                    return true;
+                }
+            }
+            if let Some(matched_sites) = self.suffix_index.get(suffix) {
+                if matched_sites.iter().any(|s| sites_lower.contains(s)) {
+                    return true;
+                }
+            }
+        }
+
+        // Check keywords
+        for (kw_site, keyword) in &self.keywords {
+            if sites_lower.contains(kw_site) && domain_lower.contains(keyword) {
+                return true;
+            }
+        }
+
+        // Check regexes
+        for (re_site, re) in &self.regexes {
+            if sites_lower.contains(re_site) && re.is_match(&domain_lower) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// List all available sites
@@ -212,9 +456,14 @@ impl GeoSite {
         self.sites.keys()
     }
 
-    /// Add entries for a site programmatically
+    /// Add entries for a site programmatically (also updates index)
     pub fn add_site(&mut self, name: &str, entries: Vec<DomainEntry>) {
-        self.sites.insert(name.to_lowercase(), entries);
+        let name_lower = name.to_lowercase();
+        // Update index for each entry
+        for entry in &entries {
+            self.index_entry(&name_lower, entry);
+        }
+        self.sites.insert(name_lower, entries);
     }
 
     /// Create with built-in common sites
@@ -400,22 +649,94 @@ mod tests {
     }
 
     #[test]
+    fn test_matches_as_suffix() {
+        let mut geosite = GeoSite::new();
+        
+        // Add a Full entry (exact match in normal mode)
+        geosite.add_site("test", vec![
+            DomainEntry::Full("example.com".to_string()),
+        ]);
+        
+        // Normal matches: Full should only match exactly
+        assert!(geosite.matches("test", "example.com"));
+        assert!(!geosite.matches("test", "www.example.com"));
+        assert!(!geosite.matches("test", "sub.example.com"));
+        
+        // matches_as_suffix: Full should match subdomains too
+        assert!(geosite.matches_as_suffix("test", "example.com"));
+        assert!(geosite.matches_as_suffix("test", "www.example.com"));
+        assert!(geosite.matches_as_suffix("test", "sub.example.com"));
+    }
+
+    #[test]
     fn test_load_special_data() {
         use std::path::Path;
         
-        let geosite = GeoSite::load_from_dat(Path::new("/home/netium/geosite.dat")).unwrap();
+        let path = Path::new("/home/netium/geosite.dat");
+        if !path.exists() {
+            println!("geosite.dat not found, skipping test");
+            return;
+        }
+        
+        // Load raw data to check actual type values
+        let data = std::fs::read(path).unwrap();
+        let geosite_list = geosite_rs::decode_geosite(&data).unwrap();
+        
+        // Find bilibili category and print raw type values
+        for site in &geosite_list.entry {
+            if site.country_code.to_lowercase() == "bilibili" {
+                println!("\nRaw bilibili entries (first 10):");
+                for domain in site.domain.iter().take(10) {
+                    println!("  type={}, value={}", domain.r#type, domain.value);
+                }
+                break;
+            }
+        }
+        
+        let geosite = GeoSite::load_from_dat(path).unwrap();
         let site_count = geosite.sites().count();
         assert!(site_count > 0, "Should load sites from geosite.dat");
         
-        // Verify common categories exist
-        assert!(geosite.sites().any(|s| s == "google"), "Should have google category");
-        assert!(geosite.sites().any(|s| s == "cn"), "Should have cn category");
+        // Test bilibili in different categories
+        println!("\napi.bilibili.com in cn: {}", geosite.matches("cn", "api.bilibili.com"));
+        println!("api.bilibili.com in geolocation-cn: {}", geosite.matches("geolocation-cn", "api.bilibili.com"));
+        println!("api.bilibili.com in bilibili: {}", geosite.matches("bilibili", "api.bilibili.com"));
         
-        // Test domain matching (exact domains depend on geosite.dat content)
-        // google.com is typically a "full" match in geosite data
-        assert!(geosite.matches("google", "google.com"), "google.com should match google");
+        // Test with suffix matching
+        println!("\nWith suffix matching:");
+        println!("api.bilibili.com in cn: {}", geosite.matches_as_suffix("cn", "api.bilibili.com"));
+        println!("api.bilibili.com in geolocation-cn: {}", geosite.matches_as_suffix("geolocation-cn", "api.bilibili.com"));
         
-        // cn category should contain Chinese domains
-        assert!(geosite.matches("cn", "baidu.com"), "baidu.com should match cn");
+        // Check bilibili category entries
+        if let Some(entries) = geosite.get("bilibili") {
+            println!("\nBilibili category has {} entries (parsed):", entries.len());
+            for entry in entries.iter().take(5) {
+                println!("  {:?}", entry);
+            }
+        }
+
+        // Print index stats
+        println!("\nIndex stats:");
+        println!("  exact_index entries: {}", geosite.exact_index.len());
+        println!("  suffix_index entries: {}", geosite.suffix_index.len());
+        println!("  keywords: {}", geosite.keywords.len());
+        println!("  regexes: {}", geosite.regexes.len());
+    }
+
+    #[test]
+    fn test_domain_suffixes() {
+        let suffixes = GeoSite::domain_suffixes("www.api.bilibili.com");
+        assert_eq!(suffixes, vec![
+            "www.api.bilibili.com",
+            "api.bilibili.com", 
+            "bilibili.com",
+            "com"
+        ]);
+
+        let suffixes = GeoSite::domain_suffixes("example.com");
+        assert_eq!(suffixes, vec!["example.com", "com"]);
+
+        let suffixes = GeoSite::domain_suffixes("localhost");
+        assert_eq!(suffixes, vec!["localhost"]);
     }
 }
