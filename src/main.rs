@@ -57,7 +57,14 @@ fn main() -> Result<()> {
     info!("Netium v{} starting...", env!("CARGO_PKG_VERSION"));
 
     // Convert Config to RuntimeConfig
-    let runtime_config = convert_config(&config);
+    let mut runtime_config = convert_config(&config);
+    
+    // Override API listen from command line, or use config file value
+    if args.api_listen.is_some() {
+        runtime_config.api_listen = args.api_listen;
+    } else if let Some(api) = &config.api {
+        runtime_config.api_listen = Some(api.listen.clone());
+    }
 
     // Run Netium
     let rt = tokio::runtime::Runtime::new()?;
@@ -217,6 +224,7 @@ fn convert_config(config: &Config) -> RuntimeConfig {
             rules,
             default_outbound,
         },
+        api_listen: None,
     }
 }
 
@@ -225,6 +233,7 @@ struct Args {
     config: Option<PathBuf>,
     gen_config: Option<String>,
     version: bool,
+    api_listen: Option<String>,
 }
 
 impl Args {
@@ -233,6 +242,7 @@ impl Args {
         let mut config = None;
         let mut gen_config = None;
         let mut version = false;
+        let mut api_listen = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -246,6 +256,12 @@ impl Args {
                 "--gen-config" => {
                     if i + 1 < args.len() {
                         gen_config = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                }
+                "--api" => {
+                    if i + 1 < args.len() {
+                        api_listen = Some(args[i + 1].clone());
                         i += 1;
                     }
                 }
@@ -263,7 +279,7 @@ impl Args {
             i += 1;
         }
 
-        Self { config, gen_config, version }
+        Self { config, gen_config, version, api_listen }
     }
 }
 
@@ -276,13 +292,23 @@ USAGE:
 OPTIONS:
     -c, --config <FILE>     Path to configuration file
     --gen-config <TYPE>     Generate example config (client/server)
+    --api <ADDR>            Stats API listen address (e.g., 127.0.0.1:9090)
     -v, --version           Print version information
     -h, --help              Print help information
 
 EXAMPLES:
     netium -c config.json
+    netium -c config.json --api 127.0.0.1:9090
     netium --gen-config client > client.json
     netium --gen-config server > server.json
+
+STATS API ENDPOINTS:
+    GET /metrics             Prometheus metrics (for Grafana/Prometheus)
+    GET /api/stats           Overview of all statistics
+    GET /api/stats/dispatcher  Dispatcher stats (connections, traffic)
+    GET /api/stats/router      Router stats (rule hits)
+    GET /api/stats/inbounds    Per-inbound stats
+    GET /api/stats/outbounds   Per-outbound stats
 "#);
 }
 

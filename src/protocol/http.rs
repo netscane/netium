@@ -113,6 +113,7 @@ impl ProxyProtocol for HttpProtocol {
             stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
+            stream.flush().await?;
         }
 
         let metadata = Metadata::new(address).with_protocol("http");

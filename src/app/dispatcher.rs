@@ -10,13 +10,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
 
 use crate::common::{Metadata, Result, Stream};
 use crate::error::Error;
 use crate::router::Router;
 
+use super::metrics::{
+    ConnectionMetrics, TRAFFIC_BYTES_DOWNLOADED, TRAFFIC_BYTES_UPLOADED,
+    OUTBOUND_BYTES_DOWNLOADED, OUTBOUND_BYTES_UPLOADED,
+};
 use super::stack::OutboundStack;
+use super::stats_api::{DispatcherStats, OutboundStats};
 
 /// Dispatcher handles the core proxy flow
 pub struct Dispatcher {
@@ -24,11 +29,32 @@ pub struct Dispatcher {
     router: Arc<dyn Router>,
     /// Available outbound stacks
     outbounds: HashMap<String, Arc<OutboundStack>>,
+    /// Dispatcher statistics
+    stats: Option<Arc<DispatcherStats>>,
+    /// Per-outbound statistics
+    outbound_stats: Option<Arc<HashMap<String, Arc<OutboundStats>>>>,
 }
 
 impl Dispatcher {
     pub fn new(router: Arc<dyn Router>, outbounds: HashMap<String, Arc<OutboundStack>>) -> Self {
-        Self { router, outbounds }
+        Self { 
+            router, 
+            outbounds,
+            stats: None,
+            outbound_stats: None,
+        }
+    }
+
+    /// Set dispatcher statistics collector
+    pub fn with_stats(mut self, stats: Arc<DispatcherStats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Set per-outbound statistics
+    pub fn with_outbound_stats(mut self, outbound_stats: Arc<HashMap<String, Arc<OutboundStats>>>) -> Self {
+        self.outbound_stats = Some(outbound_stats);
+        self
     }
 
     /// Dispatch a connection
@@ -36,9 +62,14 @@ impl Dispatcher {
     /// This is the core function that:
     /// 1. Uses router to select outbound
     /// 2. Connects via outbound stack
-    /// 3. Relays data bidirectionally
+    /// 3. Relays data bidirectionally with metering
     pub async fn dispatch(&self, metadata: Metadata, inbound_stream: Stream) -> Result<()> {
         let start = Instant::now();
+
+        // Record connection start
+        if let Some(stats) = &self.stats {
+            stats.connection_start();
+        }
 
         // 1. Select outbound
         let outbound_tag = self.router.select(&metadata);
@@ -53,16 +84,55 @@ impl Dispatcher {
             .get(outbound_tag)
             .ok_or_else(|| Error::Config(format!("Unknown outbound: {}", outbound_tag)))?;
 
+        // Get outbound stats if available
+        let outbound_stat = self.outbound_stats.as_ref()
+            .and_then(|m| m.get(outbound_tag).cloned());
+
+        // Record outbound connection start
+        if let Some(stat) = &outbound_stat {
+            stat.connection_start();
+        }
+
+        // Create connection metrics for duration tracking
+        let conn_metrics = ConnectionMetrics::new(outbound_tag);
+
         // 3. Connect to target
-        let outbound_stream = outbound.connect(&metadata).await?;
+        let outbound_stream = match outbound.connect(&metadata).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                // Record failure
+                if let Some(stats) = &self.stats {
+                    stats.connection_failed();
+                }
+                if let Some(stat) = &outbound_stat {
+                    stat.dec_active();
+                }
+                return Err(e);
+            }
+        };
 
         info!(
             "[{}] {} -> {} via [{}]",
             metadata.inbound_tag, metadata.source, metadata.destination, outbound_tag
         );
 
-        // 4. Relay data
-        let (up, down) = relay(inbound_stream, outbound_stream).await?;
+        // 4. Relay data with prometheus metrics
+        let (up, down) = relay_with_metrics(
+            inbound_stream,
+            outbound_stream,
+            outbound_tag,
+        ).await?;
+
+        // Record connection completion with duration
+        conn_metrics.record_completion();
+
+        // Record connection end
+        if let Some(stats) = &self.stats {
+            stats.connection_end(up, down);
+        }
+        if let Some(stat) = &outbound_stat {
+            stat.connection_end(up, down);
+        }
 
         let elapsed = start.elapsed();
         info!(
@@ -74,13 +144,20 @@ impl Dispatcher {
     }
 }
 
-/// Relay data bidirectionally between two streams
+/// Relay data bidirectionally with Prometheus metrics
 /// Returns (bytes_uploaded, bytes_downloaded)
-async fn relay(inbound: Stream, outbound: Stream) -> Result<(u64, u64)> {
+async fn relay_with_metrics(
+    inbound: Stream,
+    outbound: Stream,
+    outbound_tag: &str,
+) -> Result<(u64, u64)> {
     let (mut in_read, mut in_write) = tokio::io::split(inbound);
     let (mut out_read, mut out_write) = tokio::io::split(outbound);
 
-    let client_to_server = async {
+    let outbound_tag_up = outbound_tag.to_string();
+    let outbound_tag_down = outbound_tag.to_string();
+
+    let client_to_server = async move {
         let mut buf = vec![0u8; 32 * 1024];
         let mut total: u64 = 0;
         loop {
@@ -92,13 +169,18 @@ async fn relay(inbound: Stream, outbound: Stream) -> Result<(u64, u64)> {
             out_write.write_all(&buf[..n]).await?;
             out_write.flush().await?;
             total += n as u64;
+            
+            // Record to prometheus metrics
+            TRAFFIC_BYTES_UPLOADED.inc_by(n as u64);
+            OUTBOUND_BYTES_UPLOADED.with_label_values(&[&outbound_tag_up]).inc_by(n as u64);
+            
             trace!("Client -> Server: {} bytes (total: {})", n, total);
         }
         out_write.shutdown().await?;
         Ok::<_, std::io::Error>(total)
     };
 
-    let server_to_client = async {
+    let server_to_client = async move {
         let mut buf = vec![0u8; 32 * 1024];
         let mut total: u64 = 0;
         loop {
@@ -110,6 +192,11 @@ async fn relay(inbound: Stream, outbound: Stream) -> Result<(u64, u64)> {
             in_write.write_all(&buf[..n]).await?;
             in_write.flush().await?;
             total += n as u64;
+            
+            // Record to prometheus metrics
+            TRAFFIC_BYTES_DOWNLOADED.inc_by(n as u64);
+            OUTBOUND_BYTES_DOWNLOADED.with_label_values(&[&outbound_tag_down]).inc_by(n as u64);
+            
             trace!("Server -> Client: {} bytes (total: {})", n, total);
         }
         in_write.shutdown().await?;
@@ -129,13 +216,4 @@ async fn relay(inbound: Stream, outbound: Stream) -> Result<(u64, u64)> {
     });
 
     Ok((up, down))
-}
-
-/// Copy data from reader to writer
-async fn copy_bidirectional(
-    mut inbound: Stream,
-    mut outbound: Stream,
-) -> Result<(u64, u64)> {
-    let result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
-    Ok(result)
 }

@@ -7,6 +7,7 @@
 //! - Managing lifecycle
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -15,11 +16,12 @@ use tracing::{debug, error, info, warn};
 use crate::common::{Address, Result};
 use crate::protocol::{DirectProtocol, HttpProtocol, ProxyProtocol, Socks5Protocol, VmessProtocol, VmessProtocolConfig, VmessSecurity};
 use crate::router::{Router, RuleRouter, StaticRouter};
-use crate::session::{PlainSession, Session, TlsConfig, TlsSession, TlsWebSocketSession, WebSocketConfig, WebSocketSession};
+use crate::session::{Session, TlsConfig, TlsSession, TlsWebSocketSession, WebSocketConfig, WebSocketSession};
 use crate::transport::{TcpTransport, Transport};
 
 use super::dispatcher::Dispatcher;
 use super::stack::{InboundStack, OutboundStack};
+use super::stats_api::{self, InboundStats, StatsCollector};
 
 /// Runtime configuration
 #[derive(Debug, Clone)]
@@ -27,6 +29,8 @@ pub struct RuntimeConfig {
     pub inbounds: Vec<InboundConfig>,
     pub outbounds: Vec<OutboundConfig>,
     pub routing: RoutingConfig,
+    /// Stats API listen address (e.g., "127.0.0.1:9090")
+    pub api_listen: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,14 +111,22 @@ pub struct Runtime {
     inbounds: Vec<Arc<InboundStack>>,
     dispatcher: Arc<Dispatcher>,
     shutdown_tx: broadcast::Sender<()>,
-    /// Router for statistics access (only RuleRouter supports stats)
-    router: Arc<dyn Router>,
+    /// Stats collector for API
+    stats_collector: StatsCollector,
+    /// Per-inbound statistics
+    inbound_stats: Arc<HashMap<String, Arc<InboundStats>>>,
+    /// API listen address
+    api_listen: Option<SocketAddr>,
 }
 
 impl Runtime {
     /// Build runtime from configuration
     pub fn from_config(config: RuntimeConfig) -> Result<Self> {
         let (shutdown_tx, _) = broadcast::channel(1);
+
+        // Collect tags for stats
+        let inbound_tags: Vec<String> = config.inbounds.iter().map(|i| i.tag.clone()).collect();
+        let outbound_tags: Vec<String> = config.outbounds.iter().map(|o| o.tag.clone()).collect();
 
         // Build outbounds
         let mut outbounds = HashMap::new();
@@ -148,8 +160,36 @@ impl Runtime {
             )
         };
 
-        // Build dispatcher
-        let dispatcher = Arc::new(Dispatcher::new(router.clone(), outbounds));
+        // Create stats collector
+        let stats_collector = StatsCollector::new(
+            router.clone(),
+            inbound_tags.clone(),
+            outbound_tags,
+        );
+
+        // Build per-inbound stats map
+        let mut inbound_stats_map = HashMap::new();
+        for tag in &inbound_tags {
+            if let Some(stats) = stats_collector.get_inbound_stats(tag) {
+                inbound_stats_map.insert(tag.clone(), stats);
+            }
+        }
+        let inbound_stats = Arc::new(inbound_stats_map);
+
+        // Build per-outbound stats map for dispatcher
+        let mut outbound_stats_map = HashMap::new();
+        for tag in config.outbounds.iter().map(|o| &o.tag) {
+            if let Some(stats) = stats_collector.get_outbound_stats(tag) {
+                outbound_stats_map.insert(tag.clone(), stats);
+            }
+        }
+
+        // Build dispatcher with stats
+        let dispatcher = Arc::new(
+            Dispatcher::new(router.clone(), outbounds)
+                .with_stats(stats_collector.dispatcher_stats())
+                .with_outbound_stats(Arc::new(outbound_stats_map))
+        );
 
         // Build inbounds
         let mut inbounds = Vec::new();
@@ -158,11 +198,21 @@ impl Runtime {
             inbounds.push(Arc::new(stack));
         }
 
+        // Parse API listen address
+        let api_listen = config.api_listen.as_ref().and_then(|s| {
+            s.parse::<SocketAddr>().ok().or_else(|| {
+                warn!("Invalid API listen address: {}", s);
+                None
+            })
+        });
+
         Ok(Self {
             inbounds,
             dispatcher,
             shutdown_tx,
-            router,
+            stats_collector,
+            inbound_stats,
+            api_listen,
         })
     }
 
@@ -315,9 +365,10 @@ impl Runtime {
             let inbound = inbound.clone();
             let dispatcher = self.dispatcher.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let inbound_stat = self.inbound_stats.get(&inbound.tag).cloned();
 
             let handle = tokio::spawn(async move {
-                if let Err(e) = run_inbound(inbound, dispatcher, &mut shutdown_rx).await {
+                if let Err(e) = run_inbound(inbound, dispatcher, &mut shutdown_rx, inbound_stat).await {
                     error!("Inbound error: {}", e);
                 }
             });
@@ -327,19 +378,20 @@ impl Runtime {
 
         info!("Runtime started with {} inbounds", self.inbounds.len());
 
-        // Start stats reporter task
-        let router_for_stats = self.router.clone();
-        let mut stats_shutdown_rx = self.shutdown_tx.subscribe();
-        let stats_handle = tokio::spawn(async move {
-            Self::stats_reporter(router_for_stats, &mut stats_shutdown_rx).await;
-        });
+        // Start API server if configured
+        let api_handle = if let Some(addr) = self.api_listen {
+            let collector = self.stats_collector.clone();
+            let api_shutdown_rx = self.shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                stats_api::start_api_server(addr, collector, api_shutdown_rx).await;
+            }))
+        } else {
+            None
+        };
 
         // Wait for shutdown signal (Ctrl+C)
         tokio::signal::ctrl_c().await?;
         info!("Shutting down...");
-
-        // Log final stats before shutdown
-        self.log_router_stats();
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());
@@ -348,68 +400,11 @@ impl Runtime {
         for handle in handles {
             let _ = handle.await;
         }
-        let _ = stats_handle.await;
+        if let Some(handle) = api_handle {
+            let _ = handle.await;
+        }
 
         Ok(())
-    }
-
-    /// Stats reporter task - logs stats periodically and on SIGUSR1 signal
-    #[cfg(unix)]
-    async fn stats_reporter(router: Arc<dyn Router>, shutdown_rx: &mut broadcast::Receiver<()>) {
-        // Stats interval: 1 minutes
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // Setup SIGUSR1 signal handler
-        let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-            .expect("Failed to setup SIGUSR1 handler");
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    Self::log_stats_from_router(&router);
-                }
-                _ = sigusr1.recv() => {
-                    info!("Received SIGUSR1, printing routing statistics...");
-                    Self::log_stats_from_router(&router);
-                }
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Stats reporter task - logs stats periodically (non-Unix)
-    #[cfg(not(unix))]
-    async fn stats_reporter(router: Arc<dyn Router>, shutdown_rx: &mut broadcast::Receiver<()>) {
-        // Stats interval: 5 minutes
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    Self::log_stats_from_router(&router);
-                }
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Log routing statistics
-    fn log_router_stats(&self) {
-        Self::log_stats_from_router(&self.router);
-    }
-
-    /// Log stats from a router reference
-    fn log_stats_from_router(router: &Arc<dyn Router>) {
-        // Try to downcast to RuleRouter to access stats
-        if let Some(rule_router) = router.as_any().downcast_ref::<RuleRouter>() {
-            rule_router.log_stats();
-        }
     }
 }
 
@@ -418,6 +413,7 @@ async fn run_inbound(
     inbound: Arc<InboundStack>,
     dispatcher: Arc<Dispatcher>,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    inbound_stat: Option<Arc<InboundStats>>,
 ) -> Result<()> {
     let listener = inbound.transport.bind(&inbound.listen).await?;
     info!(
@@ -438,11 +434,24 @@ async fn run_inbound(
                         let conn_id = conn_count;
                         debug!("[{}] New connection #{} from {}", inbound.tag, conn_id, source);
 
+                        // Record inbound connection
+                        if let Some(stat) = &inbound_stat {
+                            stat.connection_accepted();
+                        }
+
                         let inbound = inbound.clone();
                         let dispatcher = dispatcher.clone();
+                        let inbound_stat_clone = inbound_stat.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(inbound, dispatcher, stream, source.clone()).await {
+                            let result = handle_connection(inbound, dispatcher, stream, source.clone()).await;
+                            
+                            // Record connection closed
+                            if let Some(stat) = inbound_stat_clone {
+                                stat.connection_closed();
+                            }
+                            
+                            if let Err(e) = result {
                                 warn!("Connection #{} from {} error: {}", conn_id, source, e);
                             }
                         });

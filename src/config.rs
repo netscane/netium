@@ -17,6 +17,10 @@ pub struct Config {
     #[serde(default)]
     pub log: LogConfig,
 
+    /// API configuration
+    #[serde(default)]
+    pub api: Option<ApiConfig>,
+
     /// Inbound configurations
     #[serde(default)]
     pub inbounds: Vec<InboundConfig>,
@@ -28,6 +32,13 @@ pub struct Config {
     /// Routing rules
     #[serde(default)]
     pub routing: RoutingConfig,
+}
+
+/// API configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Listen address for stats API (e.g., "127.0.0.1:9090")
+    pub listen: String,
 }
 
 impl Config {
@@ -48,6 +59,7 @@ impl Config {
     pub fn default_client() -> Self {
         Config {
             log: LogConfig::default(),
+            api: None,
             inbounds: vec![
                 InboundConfig {
                     tag: "socks-in".to_string(),
@@ -109,6 +121,7 @@ impl Config {
     pub fn default_server() -> Self {
         Config {
             log: LogConfig::default(),
+            api: None,
             inbounds: vec![InboundConfig {
                 tag: "vmess-in".to_string(),
                 protocol: InboundProtocol::Vmess,

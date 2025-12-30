@@ -243,6 +243,7 @@ impl ProxyProtocol for Socks5Protocol {
             0,
         ];
         stream.write_all(&reply).await?;
+        stream.flush().await?;
 
         let metadata = Metadata::new(address)
             .with_network(network)
