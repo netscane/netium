@@ -317,6 +317,7 @@ pub enum OutboundProtocol {
     Shadowsocks,
     Freedom,
     Blackhole,
+    Reject,
 }
 
 /// Outbound settings (protocol-specific)
@@ -327,6 +328,7 @@ pub enum OutboundSettings {
     Vmess(VmessOutboundSettings),
     Shadowsocks(ShadowsocksSettings),
     Blackhole,
+    Reject,
 }
 
 /// VMess outbound settings
