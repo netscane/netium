@@ -4,7 +4,9 @@ use std::any::Any;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
+use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_DURATION, ROUTER_DECISIONS_TOTAL};
 use crate::common::{Address, Metadata, Network};
 use crate::geoip::GeoIpMatcher;
 use crate::geosite::GeoSiteMatcher;
@@ -66,12 +68,18 @@ pub struct Rule {
 pub struct RuleStat {
     /// Number of times this rule was hit
     pub hits: AtomicU64,
+    /// Total time spent matching this rule (in nanoseconds)
+    pub match_time_ns: AtomicU64,
+    /// Number of times this rule was evaluated (for avg calculation)
+    pub eval_count: AtomicU64,
 }
 
 impl Default for RuleStat {
     fn default() -> Self {
         Self {
             hits: AtomicU64::new(0),
+            match_time_ns: AtomicU64::new(0),
+            eval_count: AtomicU64::new(0),
         }
     }
 }
@@ -80,6 +88,8 @@ impl Clone for RuleStat {
     fn clone(&self) -> Self {
         Self {
             hits: AtomicU64::new(self.hits.load(Ordering::Relaxed)),
+            match_time_ns: AtomicU64::new(self.match_time_ns.load(Ordering::Relaxed)),
+            eval_count: AtomicU64::new(self.eval_count.load(Ordering::Relaxed)),
         }
     }
 }
@@ -93,6 +103,10 @@ pub struct RuleStatsSnapshot {
     pub hits: u64,
     /// Percentage of total hits
     pub percent: f64,
+    /// Average match time in microseconds
+    pub avg_match_time_us: f64,
+    /// Total match time in microseconds
+    pub total_match_time_us: f64,
 }
 
 /// Rule-based router
@@ -147,11 +161,22 @@ impl RuleRouter {
                 0.0
             };
 
+            let total_time_ns = self.stats[i].match_time_ns.load(Ordering::Relaxed);
+            let eval_count = self.stats[i].eval_count.load(Ordering::Relaxed);
+            let avg_match_time_us = if eval_count > 0 {
+                (total_time_ns as f64 / eval_count as f64) / 1000.0
+            } else {
+                0.0
+            };
+            let total_match_time_us = total_time_ns as f64 / 1000.0;
+
             let rule_desc = format!("{:?} -> {}", rule.rule_type, rule.outbound_tag);
             result.push(RuleStatsSnapshot {
                 rule_desc,
                 hits,
                 percent,
+                avg_match_time_us,
+                total_match_time_us,
             });
         }
 
@@ -166,6 +191,8 @@ impl RuleRouter {
             rule_desc: format!("default -> {}", self.default_outbound),
             hits: default_hits,
             percent: default_percent,
+            avg_match_time_us: 0.0,
+            total_match_time_us: 0.0,
         });
 
         result
@@ -183,6 +210,8 @@ impl RuleRouter {
     pub fn reset_stats(&self) {
         for stat in self.stats.iter() {
             stat.hits.store(0, Ordering::Relaxed);
+            stat.match_time_ns.store(0, Ordering::Relaxed);
+            stat.eval_count.store(0, Ordering::Relaxed);
         }
         self.default_hits.store(0, Ordering::Relaxed);
     }
@@ -196,11 +225,13 @@ impl RuleRouter {
         for (i, stat) in stats.iter().enumerate() {
             if i < self.rules.len() {
                 tracing::info!(
-                    "  Rule {}: {} | hits: {} ({:.2}%)",
+                    "  Rule {}: {} | hits: {} ({:.2}%) | avg: {:.2}µs, total: {:.2}ms",
                     i + 1,
                     stat.rule_desc,
                     stat.hits,
-                    stat.percent
+                    stat.percent,
+                    stat.avg_match_time_us,
+                    stat.total_match_time_us / 1000.0
                 );
             } else {
                 tracing::info!(
@@ -415,16 +446,35 @@ impl RuleRouter {
 
 impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
+        ROUTER_DECISIONS_TOTAL.inc();
+        
         for (i, rule) in self.rules.iter().enumerate() {
-            if self.match_rule(rule, metadata) {
+            let start = Instant::now();
+            let matched = self.match_rule(rule, metadata);
+            let elapsed = start.elapsed();
+            let elapsed_ns = elapsed.as_nanos() as u64;
+            
+            // Record evaluation time (internal stats)
+            self.stats[i].match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+            self.stats[i].eval_count.fetch_add(1, Ordering::Relaxed);
+            
+            // Record to Prometheus
+            let rule_label = format!("rule_{}", i + 1);
+            ROUTER_RULE_MATCH_DURATION
+                .with_label_values(&[&rule_label])
+                .observe(elapsed.as_secs_f64());
+            
+            if matched {
                 // Record hit
                 self.stats[i].hits.fetch_add(1, Ordering::Relaxed);
+                ROUTER_RULE_HITS.with_label_values(&[&rule_label]).inc();
                 return &rule.outbound_tag;
             }
         }
 
         // Record default hit
         self.default_hits.fetch_add(1, Ordering::Relaxed);
+        ROUTER_RULE_HITS.with_label_values(&["default"]).inc();
         &self.default_outbound
     }
 

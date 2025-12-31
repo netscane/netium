@@ -112,6 +112,15 @@ lazy_static! {
         "Total number of routing decisions made"
     ).unwrap();
 
+    /// Rule match duration histogram (in seconds)
+    pub static ref ROUTER_RULE_MATCH_DURATION: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "netium_router_rule_match_duration_seconds",
+            "Time spent matching each routing rule"
+        ).buckets(vec![0.000001, 0.000005, 0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01]),
+        &["rule"]
+    ).unwrap();
+
     // === Connection Duration ===
     
     /// Connection duration histogram
@@ -150,6 +159,7 @@ pub fn init_metrics() {
     // Router metrics
     REGISTRY.register(Box::new(ROUTER_RULE_HITS.clone())).ok();
     REGISTRY.register(Box::new(ROUTER_DECISIONS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(ROUTER_RULE_MATCH_DURATION.clone())).ok();
     
     // Connection duration
     REGISTRY.register(Box::new(CONNECTION_DURATION_SECONDS.clone())).ok();
