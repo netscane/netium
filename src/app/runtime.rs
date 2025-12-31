@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::common::{Address, Result};
-use crate::protocol::{DirectProtocol, HttpProtocol, ProxyProtocol, Socks5Protocol, VmessProtocol, VmessProtocolConfig, VmessSecurity};
+use crate::protocol::{BlackholeProtocol, DirectProtocol, HttpProtocol, ProxyProtocol, RejectProtocol, Socks5Protocol, VmessProtocol, VmessProtocolConfig, VmessSecurity};
 use crate::router::{Router, RuleRouter, StaticRouter};
 use crate::session::{Session, TlsConfig, TlsSession, TlsWebSocketSession, WebSocketConfig, WebSocketSession};
 use crate::transport::{TcpTransport, Transport};
@@ -264,6 +264,8 @@ impl Runtime {
             "socks" | "socks5" => Arc::new(Socks5Protocol::new(Default::default())),
             "http" => Arc::new(HttpProtocol::new(Default::default())),
             "direct" | "freedom" => Arc::new(DirectProtocol),
+            "blackhole" => Arc::new(BlackholeProtocol::new()),
+            "reject" => Arc::new(RejectProtocol::new()),
             "vmess" => {
                 let uuid = config.settings.uuid.as_ref()
                     .and_then(|s| uuid::Uuid::parse_str(s).ok())

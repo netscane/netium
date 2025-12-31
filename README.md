@@ -94,10 +94,19 @@ cargo build --release
         {
             "tag": "direct",
             "protocol": "direct"
+        },
+        {
+            "tag": "block",
+            "protocol": "blackhole"
+        },
+        {
+            "tag": "reject",
+            "protocol": "reject"
         }
     ],
     "routing": {
         "rules": [
+            { "type": "field", "domain": ["geosite:category-ads-all"], "outbound_tag": "reject" },
             { "type": "chinasites", "outbound_tag": "direct" },
             { "type": "chinaip", "outbound_tag": "direct" },
             { "type": "privateip", "outbound_tag": "direct" },
@@ -162,6 +171,8 @@ You can download the data files from [v2ray/geoip](https://github.com/v2fly/geoi
 |----------|-------------|
 | `vmess` | VMess client |
 | `direct` | Direct connection (bypass proxy) |
+| `blackhole` | Drop connection (keeps open, simulates unresponsive server) |
+| `reject` | Reject connection (immediately closes) |
 
 ### Transport
 

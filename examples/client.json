@@ -60,11 +60,28 @@
             "protocol": "direct",
             "settings": null,
             "transport": null
+        },
+        {
+            "tag": "block",
+            "protocol": "blackhole",
+            "settings": null,
+            "transport": null
+        },
+        {
+            "tag": "reject",
+            "protocol": "reject",
+            "settings": null,
+            "transport": null
         }
     ],
     "routing": {
         "domain_strategy": "AsIs",
         "rules": [
+            {
+                "type": "field",
+                "domain": ["geosite:category-ads-all"],
+                "outbound_tag": "reject"
+            },
             {
                 "type": "chinasites",
                 "outbound_tag": "direct"

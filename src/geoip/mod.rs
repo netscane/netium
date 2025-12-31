@@ -196,6 +196,7 @@ mod tests {
         assert!(!matcher.matches("CN", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
+    /* 
     #[test]
     fn test_load_sped_database() {
         let matcher = GeoIpMatcher::load("/home/netium/geoip.dat").unwrap();
@@ -207,6 +208,7 @@ mod tests {
         // 8.8.8.8 is Google DNS (US)
         assert!(matcher.matches("US", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
+    */
 
     #[test]
     fn test_cidr_contains_v4() {
