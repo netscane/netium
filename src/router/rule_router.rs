@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_DURATION, ROUTER_DECISIONS_TOTAL};
+use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_DURATION, ROUTER_RULE_MATCH_MAX, ROUTER_DECISIONS_TOTAL};
 use crate::common::{Address, Metadata, Network};
 use crate::geoip::GeoIpMatcher;
 use crate::geosite::GeoSiteMatcher;
@@ -460,9 +460,17 @@ impl Router for RuleRouter {
             
             // Record to Prometheus
             let rule_label = format!("rule_{}", i + 1);
+            let elapsed_secs = elapsed.as_secs_f64();
             ROUTER_RULE_MATCH_DURATION
                 .with_label_values(&[&rule_label])
-                .observe(elapsed.as_secs_f64());
+                .observe(elapsed_secs);
+            
+            // Update max if this is larger
+            let max_gauge = ROUTER_RULE_MATCH_MAX.with_label_values(&[&rule_label]);
+            let current_max = max_gauge.get();
+            if elapsed_secs > current_max {
+                max_gauge.set(elapsed_secs);
+            }
             
             if matched {
                 // Record hit

@@ -5,7 +5,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 
 lazy_static! {
@@ -121,6 +122,15 @@ lazy_static! {
         &["rule"]
     ).unwrap();
 
+    /// Maximum rule match duration (in seconds)
+    pub static ref ROUTER_RULE_MATCH_MAX: GaugeVec = GaugeVec::new(
+        Opts::new(
+            "netium_router_rule_match_max_seconds",
+            "Maximum time spent matching each routing rule"
+        ),
+        &["rule"]
+    ).unwrap();
+
     // === Connection Duration ===
     
     /// Connection duration histogram
@@ -160,6 +170,7 @@ pub fn init_metrics() {
     REGISTRY.register(Box::new(ROUTER_RULE_HITS.clone())).ok();
     REGISTRY.register(Box::new(ROUTER_DECISIONS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ROUTER_RULE_MATCH_DURATION.clone())).ok();
+    REGISTRY.register(Box::new(ROUTER_RULE_MATCH_MAX.clone())).ok();
     
     // Connection duration
     REGISTRY.register(Box::new(CONNECTION_DURATION_SECONDS.clone())).ok();
