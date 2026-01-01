@@ -113,8 +113,8 @@ impl GeoSiteMatcher {
     }
 
     /// Check if domain matches any of the given sites (with suffix matching)
-    pub fn matches_any_as_suffix(&self, sites: &[&str], domain: &str) -> bool {
-        self.geosite.matches_any_as_suffix(sites, domain)
+    pub fn matches_any(&self, sites: &[&str], domain: &str) -> bool {
+        self.geosite.matches_any(sites, domain)
     }
 
     /// Check if domain is a China domain (with LRU cache)
@@ -131,8 +131,7 @@ impl GeoSiteMatcher {
         }
         
         // Cache miss - perform actual lookup
-        let is_china = self.geosite.matches_as_suffix("cn", &domain_lower)
-            || self.geosite.matches_as_suffix("geolocation-cn", &domain_lower);
+        let is_china = self.geosite.matches_any(&["cn", "geolocation-cn"], &domain_lower);
         
         // Store in cache
         {

@@ -88,16 +88,17 @@ impl DomainEntry {
 impl From<&Domain> for DomainEntry {
     fn from(domain: &Domain) -> Self {
         let value = domain.value.to_lowercase();
-        // geosite-rs domain types (from geosite_to_hashmap in geosite-rs):
-        // 0 = DOMAIN-KEYWORD (Plain/Keyword - substring match)
-        // 1 = DOMAIN-SUFFIX (Domain - suffix match)
-        // 2 = DOMAIN (Full - exact match)
-        // 3 = DOMAIN-REGEX (Regex)
+        // V2Ray protobuf Domain.Type definition (from v2ray-core/app/router/routercommon/common.proto):
+        // 0 = Plain (Keyword - substring match)
+        // 1 = Regex (regular expression)
+        // 2 = RootDomain (Domain - suffix match, matches domain and subdomains)
+        // 3 = Full (exact match only)
+        // Note: geosite-rs library has incorrect mapping in geosite_to_hashmap(), we use correct V2Ray mapping here
         match domain.r#type {
-            0 => DomainEntry::Keyword(value),                    // Keyword/substring match
-            1 => DomainEntry::Domain(value),                     // Domain suffix match
-            2 => DomainEntry::Full(value),                       // Full exact match
-            3 => DomainEntry::Regex(domain.value.clone()),       // Regex (keep original case)
+            0 => DomainEntry::Keyword(value),                    // Plain/Keyword - substring match
+            1 => DomainEntry::Regex(domain.value.clone()),       // Regex (keep original case)
+            2 => DomainEntry::Domain(value),                     // RootDomain - suffix match
+            3 => DomainEntry::Full(value),                       // Full - exact match
             _ => DomainEntry::Domain(value),                     // Default to domain suffix
         }
     }
@@ -337,118 +338,76 @@ impl GeoSite {
         suffixes
     }
 
-    /// Check if a domain matches a site using inverted index
+    /// Core matching function
+    /// - `full_as_suffix`: if true, treat Full entries as suffix match
+    /// - `site_filter`: closure to check if a site matches
+    fn matches_internal<F>(&self, domain: &str, full_as_suffix: bool, site_filter: F) -> bool
+    where
+        F: Fn(&str) -> bool,
+    {
+        let domain_lower = domain.to_lowercase();
+
+        // Check exact_index (Full entries)
+        if full_as_suffix {
+            // Treat Full as suffix match
+            for suffix in Self::domain_suffixes(&domain_lower) {
+                if let Some(sites) = self.exact_index.get(suffix) {
+                    if sites.iter().any(|s| site_filter(s)) {
+                        return true;
+                    }
+                }
+            }
+        } else {
+            // Exact match only
+            if let Some(sites) = self.exact_index.get(&domain_lower) {
+                if sites.iter().any(|s| site_filter(s)) {
+                    return true;
+                }
+            }
+        }
+
+        // Check suffix_index (Domain entries) - always suffix match
+        for suffix in Self::domain_suffixes(&domain_lower) {
+            if let Some(sites) = self.suffix_index.get(suffix) {
+                if sites.iter().any(|s| site_filter(s)) {
+                    return true;
+                }
+            }
+        }
+
+        // Check keywords
+        for (kw_site, keyword) in &self.keywords {
+            if site_filter(kw_site) && domain_lower.contains(keyword) {
+                return true;
+            }
+        }
+
+        // Check regexes
+        for (re_site, re) in &self.regexes {
+            if site_filter(re_site) && re.is_match(&domain_lower) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a domain matches a site (Full entries require exact match)
     pub fn matches(&self, site: &str, domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
         let site_lower = site.to_lowercase();
-
-        // 1. Check exact match index (Full entries)
-        if let Some(sites) = self.exact_index.get(&domain_lower) {
-            if sites.contains(&site_lower) {
-                return true;
-            }
-        }
-
-        // 2. Check suffix match index (Domain entries)
-        // Try each suffix of the domain
-        for suffix in Self::domain_suffixes(&domain_lower) {
-            if let Some(sites) = self.suffix_index.get(suffix) {
-                if sites.contains(&site_lower) {
-                    return true;
-                }
-            }
-        }
-
-        // 3. Check keywords (need to iterate)
-        for (kw_site, keyword) in &self.keywords {
-            if kw_site == &site_lower && domain_lower.contains(keyword) {
-                return true;
-            }
-        }
-
-        // 4. Check regexes (need to iterate)
-        for (re_site, re) in &self.regexes {
-            if re_site == &site_lower && re.is_match(&domain_lower) {
-                return true;
-            }
-        }
-
-        false
+        self.matches_internal(domain, false, |s| s == site_lower)
     }
 
-    /// Check if a domain matches a site, treating Full entries as suffix match
-    /// Uses inverted index for fast lookup
+    /// Check if a domain matches a site (Full entries treated as suffix match)
     pub fn matches_as_suffix(&self, site: &str, domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
         let site_lower = site.to_lowercase();
-
-        // For suffix matching, both exact_index and suffix_index use suffix matching
-        for suffix in Self::domain_suffixes(&domain_lower) {
-            // Check exact index (Full entries treated as suffix)
-            if let Some(sites) = self.exact_index.get(suffix) {
-                if sites.contains(&site_lower) {
-                    return true;
-                }
-            }
-            // Check suffix index (Domain entries)
-            if let Some(sites) = self.suffix_index.get(suffix) {
-                if sites.contains(&site_lower) {
-                    return true;
-                }
-            }
-        }
-
-        // Check keywords
-        for (kw_site, keyword) in &self.keywords {
-            if kw_site == &site_lower && domain_lower.contains(keyword) {
-                return true;
-            }
-        }
-
-        // Check regexes
-        for (re_site, re) in &self.regexes {
-            if re_site == &site_lower && re.is_match(&domain_lower) {
-                return true;
-            }
-        }
-
-        false
+        self.matches_internal(domain, true, |s| s == site_lower)
     }
 
-    /// Check if a domain matches any of the given sites (with suffix matching)
-    pub fn matches_any_as_suffix(&self, sites: &[&str], domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
+    /// Check if a domain matches any of the given sites (Full entries treated as suffix match)
+    pub fn matches_any(&self, sites: &[&str], domain: &str) -> bool {
         let sites_lower: HashSet<String> = sites.iter().map(|s| s.to_lowercase()).collect();
-
-        // Check both indexes with suffix matching
-        for suffix in Self::domain_suffixes(&domain_lower) {
-            if let Some(matched_sites) = self.exact_index.get(suffix) {
-                if matched_sites.iter().any(|s| sites_lower.contains(s)) {
-                    return true;
-                }
-            }
-            if let Some(matched_sites) = self.suffix_index.get(suffix) {
-                if matched_sites.iter().any(|s| sites_lower.contains(s)) {
-                    return true;
-                }
-            }
-        }
-
-        // Check keywords
-        for (kw_site, keyword) in &self.keywords {
-            if sites_lower.contains(kw_site) && domain_lower.contains(keyword) {
-                return true;
-            }
-        }
-
-        // Check regexes
-        for (re_site, re) in &self.regexes {
-            if sites_lower.contains(re_site) && re.is_match(&domain_lower) {
-                return true;
-            }
-        }
-
-        false
+        self.matches_internal(domain, true, |s| sites_lower.contains(s))
     }
 
     /// List all available sites
