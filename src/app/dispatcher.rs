@@ -3,11 +3,22 @@
 //! The dispatcher is the heart of the proxy system.
 //! It handles the flow: inbound → router → outbound
 //!
+//! Architecture:
+//! ```text
+//! InboundPipeline.process() → (Metadata, Stream)
+//!                                  ↓
+//!                         Router.select(Metadata)
+//!                                  ↓
+//!                         Outbound.connect()
+//!                                  ↓
+//!                         Bidirectional Relay
+//! ```
+//!
 //! Each connection is handled in a separate tokio task.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
@@ -20,22 +31,38 @@ use super::metrics::{
     ConnectionMetrics, OUTBOUND_BYTES_DOWNLOADED, OUTBOUND_BYTES_UPLOADED,
     TRAFFIC_BYTES_DOWNLOADED, TRAFFIC_BYTES_UPLOADED,
 };
-use super::stack::OutboundStack;
+use super::runtime::Outbound;
 use super::stats_api::{DispatcherStats, OutboundStats};
 
-/// Blackhole timeout duration (5 minutes)
-const BLACKHOLE_TIMEOUT: Duration = Duration::from_secs(300);
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Relay buffer size (32KB)
+const RELAY_BUFFER_SIZE: usize = 32 * 1024;
+
+// ============================================================================
+// Dispatcher
+// ============================================================================
 
 /// Dispatcher handles the core proxy flow
+///
+/// Responsibilities:
+/// - Execute inbound pipeline
+/// - Call Router to select outbound
+/// - Build and execute outbound pipeline
+/// - Perform bidirectional stream relay
+///
+/// The Dispatcher is protocol-agnostic - it only works with Stream and Metadata.
 pub struct Dispatcher {
     router: Arc<dyn Router>,
-    outbounds: HashMap<String, Arc<OutboundStack>>,
+    outbounds: HashMap<String, Arc<Outbound>>,
     stats: Option<Arc<DispatcherStats>>,
     outbound_stats: Option<Arc<HashMap<String, Arc<OutboundStats>>>>,
 }
 
 impl Dispatcher {
-    pub fn new(router: Arc<dyn Router>, outbounds: HashMap<String, Arc<OutboundStack>>) -> Self {
+    pub fn new(router: Arc<dyn Router>, outbounds: HashMap<String, Arc<Outbound>>) -> Self {
         Self {
             router,
             outbounds,
@@ -58,6 +85,9 @@ impl Dispatcher {
     }
 
     /// Dispatch a connection through router to appropriate outbound
+    ///
+    /// This is the main entry point for connection handling.
+    /// Flow: Router.select() → Outbound.connect() → Relay
     pub async fn dispatch(&self, metadata: Metadata, inbound_stream: Stream) -> Result<()> {
         let start = Instant::now();
 
@@ -65,7 +95,7 @@ impl Dispatcher {
             stats.connection_start();
         }
 
-        // Select and get outbound
+        // Step 1: Router selects outbound (pure function, no IO)
         let outbound_tag = self.router.select(&metadata);
         let outbound = self
             .outbounds
@@ -81,22 +111,7 @@ impl Dispatcher {
             stat.connection_start();
         }
 
-        // Handle special protocols - no outbound connection needed
-        match outbound.protocol.name() {
-            "blackhole" => {
-                return self
-                    .handle_blackhole(&metadata, inbound_stream, outbound_tag, outbound_stat)
-                    .await;
-            }
-            "reject" => {
-                return self
-                    .handle_reject(&metadata, outbound_tag, outbound_stat)
-                    .await;
-            }
-            _ => {}
-        }
-
-        // Normal flow: connect and relay
+        // Step 2: Connect and relay (Transport handles blackhole/reject)
         self.handle_relay(
             &metadata,
             inbound_stream,
@@ -108,66 +123,12 @@ impl Dispatcher {
         .await
     }
 
-    /// Handle reject: immediately close connection
-    async fn handle_reject(
-        &self,
-        metadata: &Metadata,
-        outbound_tag: &str,
-        outbound_stat: Option<Arc<OutboundStats>>,
-    ) -> Result<()> {
-        info!(
-            "[{}] {} -> {} rejected by [{}]",
-            metadata.inbound_tag, metadata.source, metadata.destination, outbound_tag
-        );
-
-        // Connection is dropped immediately (inbound_stream not passed here)
-        self.record_connection_end(0, 0, &outbound_stat);
-        Ok(())
-    }
-
-    /// Handle blackhole: keep connection open but never respond
-    async fn handle_blackhole(
-        &self,
-        metadata: &Metadata,
-        mut stream: Stream,
-        outbound_tag: &str,
-        outbound_stat: Option<Arc<OutboundStats>>,
-    ) -> Result<()> {
-        info!(
-            "[{}] {} -> {} entering blackhole [{}]",
-            metadata.inbound_tag, metadata.source, metadata.destination, outbound_tag
-        );
-
-        // Read until client disconnects or timeout
-        let mut buf = [0u8; 1024];
-        let result = tokio::time::timeout(BLACKHOLE_TIMEOUT, async {
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => continue, // Silently discard
-                }
-            }
-        })
-        .await;
-
-        debug!(
-            "[{}] {} -> {} blackhole ended ({})",
-            metadata.inbound_tag,
-            metadata.source,
-            metadata.destination,
-            if result.is_ok() { "client disconnected" } else { "timeout" }
-        );
-
-        self.record_connection_end(0, 0, &outbound_stat);
-        Ok(())
-    }
-
-    /// Handle normal relay: connect to outbound and relay data
+    /// Handle relay: connect to outbound and relay data
     async fn handle_relay(
         &self,
         metadata: &Metadata,
         inbound_stream: Stream,
-        outbound: &Arc<OutboundStack>,
+        outbound: &Arc<Outbound>,
         outbound_tag: &str,
         outbound_stat: Option<Arc<OutboundStats>>,
         start: Instant,
@@ -179,7 +140,7 @@ impl Dispatcher {
 
         let conn_metrics = ConnectionMetrics::new(outbound_tag);
 
-        // Connect to target
+        // Transport.connect() → Pipeline.process()
         let outbound_stream = match outbound.connect(metadata).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -198,26 +159,31 @@ impl Dispatcher {
             metadata.inbound_tag, metadata.source, metadata.destination, outbound_tag
         );
 
-        // Relay data
+        // Bidirectional relay
         let (up, down) = relay_with_metrics(inbound_stream, outbound_stream, outbound_tag).await?;
 
         conn_metrics.record_completion();
         self.record_connection_end(up, down, &outbound_stat);
 
         info!(
-            "[{}] Connection closed: {} -> {} (up: {} bytes, down: {} bytes, duration: {:?})",
+            "[{}] Closed: {} -> {} (↑{} ↓{} {:?})",
             metadata.inbound_tag,
             metadata.source,
             metadata.destination,
-            up,
-            down,
+            format_bytes(up),
+            format_bytes(down),
             start.elapsed()
         );
 
         Ok(())
     }
 
-    fn record_connection_end(&self, up: u64, down: u64, outbound_stat: &Option<Arc<OutboundStats>>) {
+    fn record_connection_end(
+        &self,
+        up: u64,
+        down: u64,
+        outbound_stat: &Option<Arc<OutboundStats>>,
+    ) {
         if let Some(stats) = &self.stats {
             stats.connection_end(up, down);
         }
@@ -226,6 +192,10 @@ impl Dispatcher {
         }
     }
 }
+
+// ============================================================================
+// Relay Implementation
+// ============================================================================
 
 /// Relay data bidirectionally with Prometheus metrics
 async fn relay_with_metrics(
@@ -239,56 +209,87 @@ async fn relay_with_metrics(
     let tag_up = outbound_tag.to_string();
     let tag_down = outbound_tag.to_string();
 
-    let client_to_server = async move {
-        let mut buf = vec![0u8; 32 * 1024];
+    // Upload: client → server
+    let upload = async move {
+        let mut buf = vec![0u8; RELAY_BUFFER_SIZE];
         let mut total: u64 = 0;
+
         loop {
-            let n = in_read.read(&mut buf).await?;
-            if n == 0 {
+            let n = match in_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+
+            if out_write.write_all(&buf[..n]).await.is_err() {
                 break;
             }
-            out_write.write_all(&buf[..n]).await?;
-            out_write.flush().await?;
+            if out_write.flush().await.is_err() {
+                break;
+            }
+
             total += n as u64;
             TRAFFIC_BYTES_UPLOADED.inc_by(n as u64);
             OUTBOUND_BYTES_UPLOADED
                 .with_label_values(&[&tag_up])
                 .inc_by(n as u64);
         }
-        out_write.shutdown().await?;
-        Ok::<_, std::io::Error>(total)
+
+        let _ = out_write.shutdown().await;
+        total
     };
 
-    let server_to_client = async move {
-        let mut buf = vec![0u8; 32 * 1024];
+    // Download: server → client
+    let download = async move {
+        let mut buf = vec![0u8; RELAY_BUFFER_SIZE];
         let mut total: u64 = 0;
+
         loop {
-            let n = out_read.read(&mut buf).await?;
-            if n == 0 {
+            let n = match out_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+
+            if in_write.write_all(&buf[..n]).await.is_err() {
                 break;
             }
-            in_write.write_all(&buf[..n]).await?;
-            in_write.flush().await?;
+            if in_write.flush().await.is_err() {
+                break;
+            }
+
             total += n as u64;
             TRAFFIC_BYTES_DOWNLOADED.inc_by(n as u64);
             OUTBOUND_BYTES_DOWNLOADED
                 .with_label_values(&[&tag_down])
                 .inc_by(n as u64);
         }
-        in_write.shutdown().await?;
-        Ok::<_, std::io::Error>(total)
+
+        let _ = in_write.shutdown().await;
+        total
     };
 
-    let (up_result, down_result) = tokio::join!(client_to_server, server_to_client);
-
-    let up = up_result.unwrap_or_else(|e| {
-        debug!("Client to server relay error: {}", e);
-        0
-    });
-    let down = down_result.unwrap_or_else(|e| {
-        debug!("Server to client relay error: {}", e);
-        0
-    });
-
+    let (up, down) = tokio::join!(upload, download);
     Ok((up, down))
+}
+
+// ============================================================================
+// Utilities
+// ============================================================================
+
+/// Format bytes in human-readable form
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
 }

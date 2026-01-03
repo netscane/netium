@@ -141,9 +141,15 @@ fn convert_config(config: &Config) -> RuntimeConfig {
     }).collect();
 
     let outbounds = config.outbounds.iter().map(|o| {
-        let (address, port) = o.transport.as_ref()
-            .map(|t| (t.address.clone(), t.port))
-            .unwrap_or((None, None));
+        let (address, port, keep_alive, max_idle_conns, idle_timeout_secs) = o.transport.as_ref()
+            .map(|t| (
+                t.address.clone(),
+                t.port,
+                t.keep_alive,
+                t.max_idle_conns,
+                t.idle_timeout_secs,
+            ))
+            .unwrap_or((None, None, None, None, None));
 
         let (uuid, security) = match &o.settings {
             OutboundSettings::Vmess(vmess) => {
@@ -198,6 +204,9 @@ fn convert_config(config: &Config) -> RuntimeConfig {
                 port,
                 uuid,
                 security,
+                keep_alive,
+                max_idle_conns,
+                idle_timeout_secs,
             },
             transport,
         }

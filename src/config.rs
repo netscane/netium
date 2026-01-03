@@ -379,6 +379,18 @@ pub struct TransportConfig {
 
     /// TLS settings
     pub tls_settings: Option<TlsSettings>,
+
+    /// Enable connection pooling / keep-alive (default: true)
+    #[serde(default)]
+    pub keep_alive: Option<bool>,
+
+    /// Max idle connections per host (default: 6)
+    #[serde(default)]
+    pub max_idle_conns: Option<usize>,
+
+    /// Idle timeout in seconds (default: 90)
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// Transport types

@@ -2,9 +2,15 @@
 //!
 //! The runtime is responsible for:
 //! - Parsing configuration
-//! - Building trait objects
-//! - Assembling pipeline graph
+//! - Building Transport + Pipeline combinations
 //! - Managing lifecycle
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Inbound:  Transport.accept() → Stream → Pipeline.process() → (Metadata, Stream)
+//! Outbound: Transport.connect() → Stream → Pipeline.process() → Stream
+//! ```
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,22 +20,29 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::common::{Address, Result};
-use crate::protocol::{BlackholeProtocol, DirectProtocol, HttpProtocol, ProxyProtocol, RejectProtocol, Socks5Protocol, VmessProtocol, VmessProtocolConfig, VmessSecurity};
+use crate::protocol::{
+    DirectProtocol, HttpProtocol, ProxyProtocol,
+    Socks5Protocol, VmessProtocol, VmessProtocolConfig, VmessSecurity,
+};
 use crate::router::{Router, RuleRouter, StaticRouter};
-use crate::session::{Session, TlsConfig, TlsSession, TlsWebSocketSession, WebSocketConfig, WebSocketSession};
-use crate::transport::{TcpTransport, Transport};
+use crate::transport::{
+    BlackholeTransport, ChainedLayer, ConnectionPool, PoolConfig, RejectTransport, StreamLayer,
+    TcpTransport, TlsConfig, TlsWrapper, Transport, WebSocketConfig, WebSocketWrapper,
+};
 
 use super::dispatcher::Dispatcher;
-use super::stack::{InboundStack, OutboundStack};
+use super::pipeline::{InboundPipeline, OutboundPipeline};
 use super::stats_api::{self, InboundStats, StatsCollector};
 
-/// Runtime configuration
+// ============================================================================
+// Configuration Types
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub inbounds: Vec<InboundConfig>,
     pub outbounds: Vec<OutboundConfig>,
     pub routing: RoutingConfig,
-    /// Stats API listen address (e.g., "127.0.0.1:9090")
     pub api_listen: Option<String>,
 }
 
@@ -67,6 +80,12 @@ pub struct OutboundSettings {
     pub port: Option<u16>,
     pub uuid: Option<String>,
     pub security: Option<String>,
+    /// Enable connection pooling (keep-alive)
+    pub keep_alive: Option<bool>,
+    /// Max idle connections per host (default: 6)
+    pub max_idle_conns: Option<usize>,
+    /// Idle timeout in seconds (default: 90)
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,16 +125,78 @@ pub struct RouteRule {
     pub outbound_tag: String,
 }
 
+// ============================================================================
+// Inbound / Outbound (Transport + Pipeline)
+// ============================================================================
+
+/// Inbound endpoint: Transport (accept) + Pipeline (process)
+pub struct Inbound {
+    pub tag: String,
+    pub listen: Address,
+    pub transport: Arc<dyn Transport>,
+    pub pipeline: InboundPipeline,
+}
+
+/// Outbound endpoint: Transport (connect) + Pipeline (process)
+pub struct Outbound {
+    pub tag: String,
+    pub server: Option<Address>,
+    pub transport: Arc<dyn Transport>,
+    pub pipeline: OutboundPipeline,
+    pool: Option<Arc<ConnectionPool>>,
+}
+
+impl Outbound {
+    /// Connect and process through pipeline
+    pub async fn connect(&self, metadata: &crate::common::Metadata) -> Result<crate::common::Stream> {
+        let target = self.server.as_ref().unwrap_or(&metadata.destination);
+
+        // Try to get a pooled connection first
+        if let Some(pool) = &self.pool {
+            if let Some(stream) = pool.get(target) {
+                debug!("[{}] Reusing pooled connection to {}", self.tag, target);
+                return self.pipeline.process(stream, metadata).await;
+            }
+        }
+
+        debug!("[{}] Connecting to {}", self.tag, target);
+
+        // Transport creates the stream
+        let stream = self.transport.connect(target).await?;
+
+        // Pipeline transforms the stream
+        self.pipeline.process(stream, metadata).await
+    }
+
+    /// Return a connection to the pool for reuse
+    pub fn return_connection(&self, addr: &Address, stream: crate::common::Stream) {
+        if let Some(pool) = &self.pool {
+            pool.put(addr, stream);
+        }
+    }
+
+    /// Get protocol name
+    pub fn protocol_name(&self) -> &str {
+        self.pipeline.protocol_name()
+    }
+
+    /// Check if this outbound supports connection pooling
+    pub fn supports_pooling(&self) -> bool {
+        self.pool.is_some()
+    }
+}
+
+// ============================================================================
+// Runtime
+// ============================================================================
+
 /// Runtime manages the proxy system lifecycle
 pub struct Runtime {
-    inbounds: Vec<Arc<InboundStack>>,
+    inbounds: Vec<Arc<Inbound>>,
     dispatcher: Arc<Dispatcher>,
     shutdown_tx: broadcast::Sender<()>,
-    /// Stats collector for API
     stats_collector: StatsCollector,
-    /// Per-inbound statistics
     inbound_stats: Arc<HashMap<String, Arc<InboundStats>>>,
-    /// API listen address
     api_listen: Option<SocketAddr>,
 }
 
@@ -124,25 +205,21 @@ impl Runtime {
     pub fn from_config(config: RuntimeConfig) -> Result<Self> {
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        // Collect tags for stats
         let inbound_tags: Vec<String> = config.inbounds.iter().map(|i| i.tag.clone()).collect();
         let outbound_tags: Vec<String> = config.outbounds.iter().map(|o| o.tag.clone()).collect();
 
         // Build outbounds
         let mut outbounds = HashMap::new();
-        for outbound_config in &config.outbounds {
-            let stack = Self::build_outbound(outbound_config)?;
-            outbounds.insert(outbound_config.tag.clone(), Arc::new(stack));
+        for cfg in &config.outbounds {
+            let outbound = Self::build_outbound(cfg)?;
+            outbounds.insert(cfg.tag.clone(), Arc::new(outbound));
         }
 
         // Build router
         let router: Arc<dyn Router> = if config.routing.rules.is_empty() {
             Arc::new(StaticRouter::new(&config.routing.default_outbound))
         } else {
-            let rules = config
-                .routing
-                .rules
-                .iter()
+            let rules = config.routing.rules.iter()
                 .map(|r| crate::router::rule_router::Rule {
                     rule_type: crate::router::rule_router::RuleType::from_str(&r.rule_type),
                     inbound_tag: r.inbound_tag.clone(),
@@ -160,14 +237,9 @@ impl Runtime {
             )
         };
 
-        // Create stats collector
-        let stats_collector = StatsCollector::new(
-            router.clone(),
-            inbound_tags.clone(),
-            outbound_tags,
-        );
+        // Stats
+        let stats_collector = StatsCollector::new(router.clone(), inbound_tags.clone(), outbound_tags);
 
-        // Build per-inbound stats map
         let mut inbound_stats_map = HashMap::new();
         for tag in &inbound_tags {
             if let Some(stats) = stats_collector.get_inbound_stats(tag) {
@@ -176,7 +248,6 @@ impl Runtime {
         }
         let inbound_stats = Arc::new(inbound_stats_map);
 
-        // Build per-outbound stats map for dispatcher
         let mut outbound_stats_map = HashMap::new();
         for tag in config.outbounds.iter().map(|o| &o.tag) {
             if let Some(stats) = stats_collector.get_outbound_stats(tag) {
@@ -184,7 +255,7 @@ impl Runtime {
             }
         }
 
-        // Build dispatcher with stats
+        // Dispatcher
         let dispatcher = Arc::new(
             Dispatcher::new(router.clone(), outbounds)
                 .with_stats(stats_collector.dispatcher_stats())
@@ -193,12 +264,11 @@ impl Runtime {
 
         // Build inbounds
         let mut inbounds = Vec::new();
-        for inbound_config in &config.inbounds {
-            let stack = Self::build_inbound(inbound_config)?;
-            inbounds.push(Arc::new(stack));
+        for cfg in &config.inbounds {
+            let inbound = Self::build_inbound(cfg)?;
+            inbounds.push(Arc::new(inbound));
         }
 
-        // Parse API listen address
         let api_listen = config.api_listen.as_ref().and_then(|s| {
             s.parse::<SocketAddr>().ok().or_else(|| {
                 warn!("Invalid API listen address: {}", s);
@@ -216,101 +286,115 @@ impl Runtime {
         })
     }
 
-    fn build_inbound(config: &InboundConfig) -> Result<InboundStack> {
+    fn build_inbound(config: &InboundConfig) -> Result<Inbound> {
         let transport: Arc<dyn Transport> = Arc::new(TcpTransport::new());
+        let protocol = Self::build_protocol(&config.protocol, &config.settings)?;
+        let layer = config.transport.as_ref()
+            .and_then(|t| Self::build_stream_layer(t).ok().flatten());
 
-        let protocol: Arc<dyn ProxyProtocol> = match config.protocol.as_str() {
+        let mut builder = InboundPipeline::builder(&config.tag);
+        if let Some(l) = layer {
+            builder = builder.session_arc(l);
+        }
+        let pipeline = builder.protocol_arc(protocol).build();
+
+        Ok(Inbound {
+            tag: config.tag.clone(),
+            listen: parse_listen_address(&config.listen)?,
+            transport,
+            pipeline,
+        })
+    }
+
+    fn build_outbound(config: &OutboundConfig) -> Result<Outbound> {
+        let keep_alive = config.settings.keep_alive.unwrap_or(false);
+
+        let transport: Arc<dyn Transport> = match config.protocol.as_str() {
+            "blackhole" => Arc::new(BlackholeTransport::new()),
+            "reject" => Arc::new(RejectTransport::new()),
+            _ => Arc::new(TcpTransport::new()),
+        };
+
+        let pool = if keep_alive {
+            let pool_config = PoolConfig {
+                max_conns_per_host: config.settings.max_idle_conns.unwrap_or(6),
+                idle_timeout: std::time::Duration::from_secs(
+                    config.settings.idle_timeout_secs.unwrap_or(120),
+                ),
+                ..Default::default()
+            };
+            Some(Arc::new(ConnectionPool::new(pool_config)))
+        } else {
+            None
+        };
+
+        let protocol = Self::build_outbound_protocol(&config.protocol, &config.settings)?;
+        let layer = config.transport.as_ref()
+            .and_then(|t| Self::build_stream_layer(t).ok().flatten());
+
+        let server = match (&config.settings.address, config.settings.port) {
+            (Some(addr), Some(port)) => Some(Address::domain(addr.clone(), port)),
+            _ => None,
+        };
+
+        let mut builder = OutboundPipeline::builder(&config.tag);
+        if let Some(l) = layer {
+            builder = builder.session_arc(l);
+        }
+        let pipeline = builder.protocol_arc(protocol).build();
+
+        Ok(Outbound {
+            tag: config.tag.clone(),
+            server,
+            transport,
+            pipeline,
+            pool,
+        })
+    }
+
+    fn build_protocol(name: &str, settings: &InboundSettings) -> Result<Arc<dyn ProxyProtocol>> {
+        Ok(match name {
             "socks" | "socks5" => Arc::new(Socks5Protocol::new(Default::default())),
             "http" => Arc::new(HttpProtocol::new(Default::default())),
             "vmess" => {
-                // Parse VMess inbound settings - use first user's UUID
-                let uuid = config.settings.users.first()
+                let uuid = settings.users.first()
                     .and_then(|u| uuid::Uuid::parse_str(&u.uuid).ok())
                     .unwrap_or_else(uuid::Uuid::nil);
-                let vmess_config = VmessProtocolConfig {
+                Arc::new(VmessProtocol::new(VmessProtocolConfig {
                     uuid,
                     security: VmessSecurity::Auto,
                     alter_id: 0,
-                };
-                Arc::new(VmessProtocol::new(vmess_config))
+                }))
             }
-            "direct" => Arc::new(DirectProtocol),
             _ => Arc::new(DirectProtocol),
-        };
-
-        let listen = parse_listen_address(&config.listen)?;
-
-        let mut stack = InboundStack::new(&config.tag, listen, transport, protocol);
-
-        // Add session layer if configured
-        if let Some(transport_config) = &config.transport {
-            if let Some(session) = Self::build_session(transport_config)? {
-                stack = stack.with_session(session);
-            }
-        }
-
-        Ok(stack)
+        })
     }
 
-    fn build_outbound(config: &OutboundConfig) -> Result<OutboundStack> {
-        debug!(
-            "Building outbound [{}]: protocol={}, address={:?}, port={:?}, uuid={:?}",
-            config.tag, config.protocol, config.settings.address, config.settings.port, config.settings.uuid
-        );
-
-        let transport: Arc<dyn Transport> = Arc::new(TcpTransport::new());
-
-        let protocol: Arc<dyn ProxyProtocol> = match config.protocol.as_str() {
+    fn build_outbound_protocol(name: &str, settings: &OutboundSettings) -> Result<Arc<dyn ProxyProtocol>> {
+        Ok(match name {
             "socks" | "socks5" => Arc::new(Socks5Protocol::new(Default::default())),
             "http" => Arc::new(HttpProtocol::new(Default::default())),
-            "direct" | "freedom" => Arc::new(DirectProtocol),
-            "blackhole" => Arc::new(BlackholeProtocol::new()),
-            "reject" => Arc::new(RejectProtocol::new()),
             "vmess" => {
-                let uuid = config.settings.uuid.as_ref()
+                let uuid = settings.uuid.as_ref()
                     .and_then(|s| uuid::Uuid::parse_str(s).ok())
                     .unwrap_or_else(uuid::Uuid::nil);
-                let security = config.settings.security.as_deref()
+                let security = settings.security.as_deref()
                     .map(VmessSecurity::from_str)
                     .unwrap_or(VmessSecurity::Auto);
-                
-                debug!("VMess config: uuid={}, security={:?}", uuid, security);
-                
-                let vmess_config = VmessProtocolConfig {
+                Arc::new(VmessProtocol::new(VmessProtocolConfig {
                     uuid,
                     security,
                     alter_id: 0,
-                };
-                Arc::new(VmessProtocol::new(vmess_config))
+                }))
             }
+            // direct, freedom, blackhole, reject - all use DirectProtocol
+            // (blackhole/reject behavior is handled by Transport layer)
             _ => Arc::new(DirectProtocol),
-        };
-
-        let mut stack = OutboundStack::new(&config.tag, transport, protocol);
-
-        // Set server address if configured
-        if let (Some(addr), Some(port)) = (&config.settings.address, config.settings.port) {
-            debug!("Setting server address: {}:{}", addr, port);
-            stack = stack.with_server(Address::domain(addr.clone(), port));
-        }
-
-        // Add session layer if configured
-        if let Some(transport_config) = &config.transport {
-            debug!("Transport config: type={}, tls={:?}, ws={:?}", 
-                transport_config.transport_type, 
-                transport_config.tls.is_some(),
-                transport_config.websocket.is_some()
-            );
-            if let Some(session) = Self::build_session(transport_config)? {
-                stack = stack.with_session(session);
-            }
-        }
-
-        Ok(stack)
+        })
     }
 
-    fn build_session(config: &TransportConfig) -> Result<Option<Arc<dyn Session>>> {
-        let session: Option<Arc<dyn Session>> = match config.transport_type.as_str() {
+    fn build_stream_layer(config: &TransportConfig) -> Result<Option<Arc<dyn StreamLayer>>> {
+        Ok(match config.transport_type.as_str() {
             "tcp" | "" => None,
             "tls" => {
                 let tls_config = config.tls.as_ref().map(|t| TlsConfig {
@@ -320,7 +404,7 @@ impl Runtime {
                     certificate_file: t.certificate_file.clone(),
                     key_file: t.key_file.clone(),
                 }).unwrap_or_default();
-                Some(Arc::new(TlsSession::new(tls_config)))
+                Some(Arc::new(TlsWrapper::new(tls_config)))
             }
             "ws" | "websocket" => {
                 let ws_config = config.websocket.as_ref().map(|w| WebSocketConfig {
@@ -328,11 +412,9 @@ impl Runtime {
                     host: w.host.clone(),
                     headers: vec![],
                 }).unwrap_or_default();
-                Some(Arc::new(WebSocketSession::new(ws_config)))
+                Some(Arc::new(WebSocketWrapper::new(ws_config)))
             }
             "wss" => {
-                // WebSocket over TLS - need to compose both sessions
-                // For now, we'll use a combined session
                 let tls_config = config.tls.as_ref().map(|t| TlsConfig {
                     server_name: t.server_name.clone(),
                     allow_insecure: t.allow_insecure,
@@ -345,22 +427,18 @@ impl Runtime {
                     host: w.host.clone().or_else(|| tls_config.server_name.clone()),
                     headers: vec![],
                 }).unwrap_or_default();
-                
-                debug!("Building WSS session: tls_sni={:?}, ws_path={}, ws_host={:?}",
-                    tls_config.server_name, ws_config.path, ws_config.host);
-                
-                // Create a combined TLS + WebSocket session
-                Some(Arc::new(TlsWebSocketSession::new(tls_config, ws_config)))
+
+                let chained = ChainedLayer::new()
+                    .push(Arc::new(TlsWrapper::new(tls_config)))
+                    .push(Arc::new(WebSocketWrapper::new(ws_config)));
+                Some(Arc::new(chained) as Arc<dyn StreamLayer>)
             }
             _ => None,
-        };
-
-        Ok(session)
+        })
     }
 
     /// Run the runtime
     pub async fn run(&self) -> Result<()> {
-        // Start all inbound listeners
         let mut handles = Vec::new();
 
         for inbound in &self.inbounds {
@@ -380,7 +458,6 @@ impl Runtime {
 
         info!("Runtime started with {} inbounds", self.inbounds.len());
 
-        // Start API server if configured
         let api_handle = if let Some(addr) = self.api_listen {
             let collector = self.stats_collector.clone();
             let api_shutdown_rx = self.shutdown_tx.subscribe();
@@ -391,14 +468,11 @@ impl Runtime {
             None
         };
 
-        // Wait for shutdown signal (Ctrl+C)
         tokio::signal::ctrl_c().await?;
         info!("Shutting down...");
 
-        // Send shutdown signal
         let _ = self.shutdown_tx.send(());
 
-        // Wait for all tasks to complete
         for handle in handles {
             let _ = handle.await;
         }
@@ -410,19 +484,21 @@ impl Runtime {
     }
 }
 
-/// Run a single inbound listener
+// ============================================================================
+// Inbound Runner
+// ============================================================================
+
 async fn run_inbound(
-    inbound: Arc<InboundStack>,
+    inbound: Arc<Inbound>,
     dispatcher: Arc<Dispatcher>,
     shutdown_rx: &mut broadcast::Receiver<()>,
     inbound_stat: Option<Arc<InboundStats>>,
 ) -> Result<()> {
+    // Transport creates listener
     let listener = inbound.transport.bind(&inbound.listen).await?;
     info!(
         "[{}] Listening on {} (protocol: {})",
-        inbound.tag,
-        inbound.listen,
-        inbound.protocol.name()
+        inbound.tag, inbound.listen, inbound.pipeline.protocol_name()
     );
 
     let mut conn_count: u64 = 0;
@@ -433,10 +509,8 @@ async fn run_inbound(
                 match result {
                     Ok((stream, source)) => {
                         conn_count += 1;
-                        let conn_id = conn_count;
-                        debug!("[{}] New connection #{} from {}", inbound.tag, conn_id, source);
+                        debug!("[{}] Connection #{} from {}", inbound.tag, conn_count, source);
 
-                        // Record inbound connection
                         if let Some(stat) = &inbound_stat {
                             stat.connection_accepted();
                         }
@@ -444,15 +518,20 @@ async fn run_inbound(
                         let inbound = inbound.clone();
                         let dispatcher = dispatcher.clone();
                         let inbound_stat_clone = inbound_stat.clone();
+                        let conn_id = conn_count;
 
                         tokio::spawn(async move {
-                            let result = handle_connection(inbound, dispatcher, stream, source.clone()).await;
-                            
-                            // Record connection closed
+                            // Pipeline processes the stream
+                            let result = async {
+                                let (mut metadata, stream) = inbound.pipeline.process(stream).await?;
+                                metadata.source = source.clone();
+                                dispatcher.dispatch(metadata, stream).await
+                            }.await;
+
                             if let Some(stat) = inbound_stat_clone {
                                 stat.connection_closed();
                             }
-                            
+
                             if let Err(e) = result {
                                 warn!("Connection #{} from {} error: {}", conn_id, source, e);
                             }
@@ -473,28 +552,11 @@ async fn run_inbound(
     Ok(())
 }
 
-/// Handle a single connection
-async fn handle_connection(
-    inbound: Arc<InboundStack>,
-    dispatcher: Arc<Dispatcher>,
-    stream: crate::common::Stream,
-    source: Address,
-) -> Result<()> {
-    // Process through inbound stack
-    let (mut metadata, stream) = inbound.process(stream).await?;
-    metadata.source = source;
-
-    // Dispatch to outbound
-    dispatcher.dispatch(metadata, stream).await
-}
-
-/// Parse listen address string to Address
 fn parse_listen_address(s: &str) -> Result<Address> {
     if let Ok(addr) = s.parse() {
         return Ok(Address::Socket(addr));
     }
 
-    // Try host:port format
     if let Some((host, port)) = s.rsplit_once(':') {
         let port: u16 = port.parse().map_err(|_| {
             crate::error::Error::Config(format!("Invalid port in address: {}", s))
@@ -505,8 +567,5 @@ fn parse_listen_address(s: &str) -> Result<Address> {
         return Ok(Address::Domain(host.to_string(), port));
     }
 
-    Err(crate::error::Error::Config(format!(
-        "Invalid listen address: {}",
-        s
-    )))
+    Err(crate::error::Error::Config(format!("Invalid listen address: {}", s)))
 }

@@ -1,4 +1,4 @@
-//! WebSocket Session implementation
+//! WebSocket StreamLayer implementation
 
 use async_trait::async_trait;
 use std::pin::Pin;
@@ -20,21 +20,42 @@ use tracing::{debug, trace};
 use crate::common::{Result, Stream};
 use crate::error::Error;
 
-use super::{Session, WebSocketConfig};
+use super::StreamLayer;
 
-/// WebSocket session for framing streams
-pub struct WebSocketSession {
+/// WebSocket configuration
+#[derive(Debug, Clone)]
+pub struct WebSocketConfig {
+    /// WebSocket path
+    pub path: String,
+    /// Host header
+    pub host: Option<String>,
+    /// Custom headers
+    pub headers: Vec<(String, String)>,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            path: "/".to_string(),
+            host: None,
+            headers: vec![],
+        }
+    }
+}
+
+/// WebSocket wrapper for framing streams
+pub struct WebSocketWrapper {
     config: WebSocketConfig,
 }
 
-impl WebSocketSession {
+impl WebSocketWrapper {
     pub fn new(config: WebSocketConfig) -> Self {
         Self { config }
     }
 }
 
 #[async_trait]
-impl Session for WebSocketSession {
+impl StreamLayer for WebSocketWrapper {
     async fn wrap_client(&self, stream: Stream) -> Result<Stream> {
         let host = self
             .config
@@ -55,7 +76,6 @@ impl Session for WebSocketSession {
                 tokio_tungstenite::tungstenite::handshake::client::generate_key(),
             );
 
-        // Add custom headers
         for (key, value) in &self.config.headers {
             request = request.header(key.as_str(), value.as_str());
         }
@@ -65,13 +85,13 @@ impl Session for WebSocketSession {
             .map_err(|e| Error::Protocol(format!("Failed to build WebSocket request: {}", e)))?;
 
         let ws_config = TungsteniteConfig {
-            max_message_size: Some(64 << 20), // 64 MB
-            max_frame_size: Some(16 << 20),   // 16 MB
+            max_message_size: Some(64 << 20),
+            max_frame_size: Some(16 << 20),
             ..Default::default()
         };
 
         let (ws_stream, _response) =
-            client_async_with_config(request, StreamWrapper(stream), Some(ws_config))
+            client_async_with_config(request, BoxedStreamWrapper(stream), Some(ws_config))
                 .await
                 .map_err(|e| Error::Protocol(format!("WebSocket handshake failed: {}", e)))?;
 
@@ -80,14 +100,14 @@ impl Session for WebSocketSession {
 
     async fn wrap_server(&self, stream: Stream) -> Result<Stream> {
         let ws_config = TungsteniteConfig {
-            max_message_size: Some(64 << 20), // 64 MB
-            max_frame_size: Some(16 << 20),   // 16 MB
+            max_message_size: Some(64 << 20),
+            max_frame_size: Some(16 << 20),
             ..Default::default()
         };
 
         debug!("WebSocket server: accepting connection on path {}", self.config.path);
         
-        let ws_stream = accept_async_with_config(StreamWrapper(stream), Some(ws_config))
+        let ws_stream = accept_async_with_config(BoxedStreamWrapper(stream), Some(ws_config))
             .await
             .map_err(|e| Error::Protocol(format!("WebSocket handshake failed: {}", e)))?;
 
@@ -96,10 +116,10 @@ impl Session for WebSocketSession {
     }
 }
 
-/// Wrapper to make Stream work with tungstenite
-struct StreamWrapper(Stream);
+/// Wrapper to make boxed Stream work with tungstenite
+struct BoxedStreamWrapper(Stream);
 
-impl AsyncRead for StreamWrapper {
+impl AsyncRead for BoxedStreamWrapper {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -109,7 +129,7 @@ impl AsyncRead for StreamWrapper {
     }
 }
 
-impl AsyncWrite for StreamWrapper {
+impl AsyncWrite for BoxedStreamWrapper {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -170,13 +190,11 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // If already closed, return EOF
         if self.closed {
             trace!("WebSocket poll_read: already closed, returning EOF");
             return Poll::Ready(Ok(()));
         }
 
-        // Try to read next message
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(msg))) => {
                 let data = match msg {
@@ -190,7 +208,6 @@ where
                     }
                     Message::Ping(_data) => {
                         trace!("WebSocket received ping");
-                        // Ignore ping/pong, try again
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
@@ -251,7 +268,6 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // If closed, return error
         if self.closed {
             debug!("WebSocket poll_write: connection already closed");
             return Poll::Ready(Err(std::io::Error::new(
@@ -260,7 +276,6 @@ where
             )));
         }
 
-        // First ensure the sink is ready
         match Pin::new(&mut self.inner).poll_ready(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => {
@@ -274,7 +289,6 @@ where
             Poll::Pending => return Poll::Pending,
         }
 
-        // Send the data as binary message
         debug!("WebSocket sending {} bytes", buf.len());
         let msg = Message::Binary(buf.to_vec());
         match Pin::new(&mut self.inner).start_send(msg) {
@@ -313,8 +327,6 @@ where
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // WebSocket doesn't support half-close, so we just flush and return Ok
-        // The actual close will happen when the stream is dropped
         trace!("WebSocket poll_shutdown called");
         if self.closed {
             return Poll::Ready(Ok(()));

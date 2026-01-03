@@ -1,4 +1,4 @@
-//! TLS Session implementation
+//! TLS StreamLayer implementation
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -13,16 +13,43 @@ use tokio_rustls::{TlsConnector, TlsAcceptor};
 use crate::common::{Result, Stream};
 use crate::error::Error;
 
-use super::{Session, TlsConfig};
+use super::StreamLayer;
 
-/// TLS session for encrypting streams
-pub struct TlsSession {
+/// TLS configuration
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// Server name for SNI
+    pub server_name: Option<String>,
+    /// Allow insecure certificates
+    pub allow_insecure: bool,
+    /// ALPN protocols
+    pub alpn: Vec<String>,
+    /// Certificate file path (for server)
+    pub certificate_file: Option<String>,
+    /// Private key file path (for server)
+    pub key_file: Option<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            server_name: None,
+            allow_insecure: false,
+            alpn: vec![],
+            certificate_file: None,
+            key_file: None,
+        }
+    }
+}
+
+/// TLS wrapper for encrypting streams
+pub struct TlsWrapper {
     config: TlsConfig,
     connector: TlsConnector,
     acceptor: Option<TlsAcceptor>,
 }
 
-impl TlsSession {
+impl TlsWrapper {
     pub fn new(config: TlsConfig) -> Self {
         let connector = Self::build_connector(&config);
         let acceptor = Self::build_acceptor(&config);
@@ -31,15 +58,12 @@ impl TlsSession {
 
     fn build_connector(config: &TlsConfig) -> TlsConnector {
         let mut root_store = RootCertStore::empty();
-
-        // Add webpki roots
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let mut tls_config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        // Set ALPN if configured
         if !config.alpn.is_empty() {
             tls_config.alpn_protocols = config
                 .alpn
@@ -49,7 +73,6 @@ impl TlsSession {
         }
 
         if config.allow_insecure {
-            // For testing only - skip certificate verification
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(InsecureVerifier));
@@ -62,7 +85,6 @@ impl TlsSession {
         let cert_file = config.certificate_file.as_ref()?;
         let key_file = config.key_file.as_ref()?;
 
-        // Load certificates
         let certs = Self::load_certs(cert_file).ok()?;
         let key = Self::load_private_key(key_file).ok()?;
 
@@ -89,7 +111,6 @@ impl TlsSession {
             .map_err(|e| Error::Config(format!("Failed to open key file {}: {}", path, e)))?;
         let mut reader = BufReader::new(file);
         
-        // Try to read as PKCS8 first, then RSA, then EC
         let keys = rustls_pemfile::read_all(&mut reader)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Config(format!("Failed to parse private key: {}", e)))?;
@@ -108,7 +129,7 @@ impl TlsSession {
 }
 
 #[async_trait]
-impl Session for TlsSession {
+impl StreamLayer for TlsWrapper {
     async fn wrap_client(&self, stream: Stream) -> Result<Stream> {
         let server_name = self
             .config
@@ -119,9 +140,7 @@ impl Session for TlsSession {
         let domain = ServerName::try_from(server_name.clone())
             .map_err(|_| Error::Config(format!("Invalid server name: {}", server_name)))?;
 
-        // We need to convert Stream to a concrete type for TLS
-        let tls_stream = self.connector.connect(domain, StreamWrapper(stream)).await?;
-
+        let tls_stream = self.connector.connect(domain, BoxedStreamWrapper(stream)).await?;
         Ok(Box::new(tls_stream))
     }
 
@@ -129,15 +148,15 @@ impl Session for TlsSession {
         let acceptor = self.acceptor.as_ref()
             .ok_or_else(|| Error::Config("TLS server requires certificate_file and key_file".into()))?;
         
-        let tls_stream = acceptor.accept(StreamWrapper(stream)).await?;
+        let tls_stream = acceptor.accept(BoxedStreamWrapper(stream)).await?;
         Ok(Box::new(tls_stream))
     }
 }
 
-/// Wrapper to make Stream work with tokio-rustls
-struct StreamWrapper(Stream);
+/// Wrapper to make boxed Stream work with tokio-rustls
+struct BoxedStreamWrapper(Stream);
 
-impl AsyncRead for StreamWrapper {
+impl AsyncRead for BoxedStreamWrapper {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -147,7 +166,7 @@ impl AsyncRead for StreamWrapper {
     }
 }
 
-impl AsyncWrite for StreamWrapper {
+impl AsyncWrite for BoxedStreamWrapper {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

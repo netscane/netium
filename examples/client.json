@@ -52,14 +52,21 @@
                     "allow_insecure": false,
                     "certificate_file": null,
                     "key_file": null
-                }
+                },
+                "keep_alive": true,
+                "max_idle_conns": 6,
+                "idle_timeout_secs": 90
             }
         },
         {
             "tag": "direct",
             "protocol": "direct",
             "settings": null,
-            "transport": null
+            "transport": {
+                "keep_alive": true,
+                "max_idle_conns": 16,
+                "idle_timeout_secs": 120
+            }
         },
         {
             "tag": "block",

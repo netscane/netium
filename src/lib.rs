@@ -1,34 +1,45 @@
 //! Netium - A modern VPN/proxy tool
 //!
-//! # Architecture (Layered Pipeline)
+//! # Architecture
 //!
 //! ```text
-//! Transport (TCP/UDP)
-//! → Session (TLS/WebSocket/HTTP2)
-//! → Proxy Protocol (VMess/VLESS/SOCKS5/HTTP)
-//! → Router
-//! → Proxy Protocol
-//! → Session
-//! → Transport
+//! Transport: creates Stream (connect/accept)
+//! Pipeline:  transforms Stream (StreamLayer* → Protocol)
+//! Router:    decides next Transport
+//! Dispatcher: orchestrates the flow
 //! ```
 //!
-//! ## Core Principles
+//! ## Data Flow
 //!
-//! - Each layer does ONE thing
-//! - All layers abstracted via traits
-//! - Data flows as Stream + Metadata
-//! - Router only depends on Metadata, no IO
+//! ```text
+//! Inbound:
+//!   Transport.accept() → Stream → Pipeline.process() → (Metadata, Stream)
+//!                                                            ↓
+//!                                                     Router.select()
+//!                                                            ↓
+//! Outbound:
+//!   Transport.connect() → Stream → Pipeline.process() → Stream
+//!                                                            ↓
+//!                                                     Bidirectional Relay
+//! ```
+//!
+//! ## Key Concepts
+//!
+//! - **Transport**: Creates streams (TCP connect/accept, UDP, QUIC)
+//! - **StreamLayer**: Transforms streams (TLS, WebSocket, HTTP)
+//! - **Pipeline**: Chain of StreamLayers + Protocol
+//! - **Protocol**: Proxy protocol (SOCKS5, HTTP, VMess)
+//! - **Router**: Selects outbound based on Metadata
 //!
 //! ## Module Structure
 //!
 //! ```text
 //! src/
 //! ├── common/          # Core types: Stream, Metadata, Address
-//! ├── transport/       # Transport layer: TCP, UDP
-//! ├── session/         # Session layer: TLS, WebSocket
-//! ├── protocol/        # Protocol layer: SOCKS5, HTTP, VMess
-//! ├── router/          # Router: rule-based routing
-//! └── app/             # Application: Dispatcher, Runtime, Stack
+//! ├── transport/       # Transport + StreamLayer
+//! ├── protocol/        # ProxyProtocol implementations
+//! ├── router/          # Router implementations
+//! └── app/             # Dispatcher, Runtime, Pipeline
 //! ```
 
 // Core types
@@ -37,7 +48,6 @@ pub mod error;
 
 // Layered architecture
 pub mod transport;
-pub mod session;
 pub mod protocol;
 pub mod router;
 pub mod app;
@@ -54,8 +64,8 @@ pub use error::{Error, Result};
 pub use config::Config;
 
 // Architecture re-exports
-pub use app::{Dispatcher, Runtime, InboundStack, OutboundStack};
+pub use app::{Dispatcher, Runtime, InboundPipeline, OutboundPipeline};
+pub use app::runtime::{Inbound, Outbound};
 pub use protocol::ProxyProtocol;
 pub use router::Router;
-pub use session::Session;
-pub use transport::Transport;
+pub use transport::{Transport, StreamLayer};
