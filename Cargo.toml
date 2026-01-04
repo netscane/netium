@@ -8,6 +8,9 @@ license = "MIT"
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+yamux = "0.12"
 
 # Cryptography
 ring = "0.17"

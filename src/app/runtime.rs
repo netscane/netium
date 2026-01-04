@@ -26,8 +26,8 @@ use crate::protocol::{
 };
 use crate::router::{Router, RuleRouter, StaticRouter};
 use crate::transport::{
-    BlackholeTransport, ChainedLayer, ConnectionPool, PoolConfig, RejectTransport, StreamLayer,
-    TcpTransport, TlsConfig, TlsWrapper, Transport, WebSocketConfig, WebSocketWrapper,
+    BlackholeTransport, ChainedLayer, RejectTransport, StreamLayer,
+    TcpTransport, TlsConfig, TlsWrapper, Transport, WebSocketConfig, WebSocketWrapper, MuxManager,
 };
 
 use super::dispatcher::Dispatcher;
@@ -80,12 +80,8 @@ pub struct OutboundSettings {
     pub port: Option<u16>,
     pub uuid: Option<String>,
     pub security: Option<String>,
-    /// Enable connection pooling (keep-alive)
-    pub keep_alive: Option<bool>,
-    /// Max idle connections per host (default: 6)
-    pub max_idle_conns: Option<usize>,
-    /// Idle timeout in seconds (default: 90)
-    pub idle_timeout_secs: Option<u64>,
+    /// Enable multiplexing (yamux)
+    pub mux_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,6 +122,152 @@ pub struct RouteRule {
 }
 
 // ============================================================================
+// Config Conversion (From traits)
+// ============================================================================
+
+use crate::config::{
+    Config, InboundConfig as LegacyInbound, InboundSettings as LegacyInboundSettings,
+    OutboundConfig as LegacyOutbound, OutboundSettings as LegacyOutboundSettings,
+    TransportConfig as LegacyTransport, TransportType,
+};
+
+impl From<&Config> for RuntimeConfig {
+    fn from(config: &Config) -> Self {
+        let default_outbound = config
+            .outbounds
+            .first()
+            .map(|o| o.tag.clone())
+            .unwrap_or_else(|| "direct".to_string());
+
+        RuntimeConfig {
+            inbounds: config.inbounds.iter().map(InboundConfig::from).collect(),
+            outbounds: config.outbounds.iter().map(OutboundConfig::from).collect(),
+            routing: RoutingConfig {
+                rules: config.routing.rules.iter().map(RouteRule::from).collect(),
+                default_outbound,
+            },
+            api_listen: config.api.as_ref().map(|a| a.listen.clone()),
+        }
+    }
+}
+
+impl From<&LegacyInbound> for InboundConfig {
+    fn from(i: &LegacyInbound) -> Self {
+        InboundConfig {
+            tag: i.tag.clone(),
+            listen: i.listen.to_string(),
+            protocol: format!("{:?}", i.protocol).to_lowercase(),
+            settings: InboundSettings::from(&i.settings),
+            transport: i.transport.as_ref().map(|t| TransportConfig::from_legacy(t, true)),
+        }
+    }
+}
+
+impl From<&LegacyInboundSettings> for InboundSettings {
+    fn from(settings: &LegacyInboundSettings) -> Self {
+        match settings {
+            LegacyInboundSettings::Vmess(vmess) => InboundSettings {
+                users: vmess
+                    .users
+                    .iter()
+                    .map(|u| UserConfig {
+                        uuid: u.uuid.to_string(),
+                        email: Some(u.email.clone()),
+                    })
+                    .collect(),
+            },
+            _ => InboundSettings::default(),
+        }
+    }
+}
+
+impl From<&LegacyOutbound> for OutboundConfig {
+    fn from(o: &LegacyOutbound) -> Self {
+        OutboundConfig {
+            tag: o.tag.clone(),
+            protocol: format!("{:?}", o.protocol).to_lowercase(),
+            settings: OutboundSettings::from_legacy(o),
+            transport: o.transport.as_ref().map(|t| TransportConfig::from_legacy(t, false)),
+        }
+    }
+}
+
+impl OutboundSettings {
+    fn from_legacy(o: &LegacyOutbound) -> Self {
+        let (address, port) = o
+            .transport
+            .as_ref()
+            .map(|t| (t.address.clone(), t.port))
+            .unwrap_or_default();
+
+        let (uuid, security) = match &o.settings {
+            LegacyOutboundSettings::Vmess(vmess) => (
+                Some(vmess.uuid.to_string()),
+                Some(format!("{:?}", vmess.security).to_lowercase()),
+            ),
+            _ => (None, None),
+        };
+
+        OutboundSettings {
+            address,
+            port,
+            uuid,
+            security,
+            mux_enabled: None,
+        }
+    }
+}
+
+impl TransportConfig {
+    fn from_legacy(t: &LegacyTransport, _is_inbound: bool) -> Self {
+        let tls = t.tls_settings.as_ref().filter(|tls| tls.enabled).map(|tls| TlsSettings {
+            server_name: tls.server_name.clone(),
+            allow_insecure: tls.allow_insecure,
+            certificate_file: tls.certificate_file.clone(),
+            key_file: tls.key_file.clone(),
+        });
+
+        let websocket = if t.transport_type == TransportType::WebSocket {
+            t.ws_settings.as_ref().map(|ws| WebSocketSettings {
+                path: ws.path.clone(),
+                host: t.tls_settings.as_ref().and_then(|tls| tls.server_name.clone()),
+            })
+        } else {
+            None
+        };
+
+        let transport_type = match t.transport_type {
+            TransportType::Tcp => {
+                if tls.is_some() { "tls" } else { "tcp" }
+            }
+            TransportType::WebSocket => {
+                if tls.is_some() { "wss" } else { "ws" }
+            }
+            _ => "tcp",
+        };
+
+        TransportConfig {
+            transport_type: transport_type.to_string(),
+            tls,
+            websocket,
+        }
+    }
+}
+
+impl From<&crate::config::RoutingRule> for RouteRule {
+    fn from(r: &crate::config::RoutingRule) -> Self {
+        RouteRule {
+            rule_type: r.rule_type.clone(),
+            inbound_tag: r.inbound_tag.clone(),
+            domain: r.domain.clone(),
+            ip: r.ip.clone(),
+            port: r.port.clone(),
+            outbound_tag: r.outbound_tag.clone(),
+        }
+    }
+}
+
+// ============================================================================
 // Inbound / Outbound (Transport + Pipeline)
 // ============================================================================
 
@@ -143,7 +285,7 @@ pub struct Outbound {
     pub server: Option<Address>,
     pub transport: Arc<dyn Transport>,
     pub pipeline: OutboundPipeline,
-    pool: Option<Arc<ConnectionPool>>,
+    mux: Option<Arc<MuxManager>>,
 }
 
 impl Outbound {
@@ -151,28 +293,24 @@ impl Outbound {
     pub async fn connect(&self, metadata: &crate::common::Metadata) -> Result<crate::common::Stream> {
         let target = self.server.as_ref().unwrap_or(&metadata.destination);
 
-        // Try to get a pooled connection first
-        if let Some(pool) = &self.pool {
-            if let Some(stream) = pool.get(target) {
-                debug!("[{}] Reusing pooled connection to {}", self.tag, target);
-                return self.pipeline.process(stream, metadata).await;
-            }
+        // Mux path: get a stream from mux session
+        if let Some(mux) = &self.mux {
+            let key = target.to_string();
+            debug!("[{}] Using mux for {}", self.tag, target);
+            
+            let dial = || async {
+                let base_stream = self.transport.connect(target).await?;
+                self.pipeline.wrap_session_layer(base_stream).await
+            };
+            
+            let mux_stream = mux.get_stream(&key, dial).await?;
+            return self.pipeline.protocol_only(mux_stream, metadata).await;
         }
 
+        // Direct connection without mux
         debug!("[{}] Connecting to {}", self.tag, target);
-
-        // Transport creates the stream
         let stream = self.transport.connect(target).await?;
-
-        // Pipeline transforms the stream
         self.pipeline.process(stream, metadata).await
-    }
-
-    /// Return a connection to the pool for reuse
-    pub fn return_connection(&self, addr: &Address, stream: crate::common::Stream) {
-        if let Some(pool) = &self.pool {
-            pool.put(addr, stream);
-        }
     }
 
     /// Get protocol name
@@ -180,9 +318,9 @@ impl Outbound {
         self.pipeline.protocol_name()
     }
 
-    /// Check if this outbound supports connection pooling
-    pub fn supports_pooling(&self) -> bool {
-        self.pool.is_some()
+    /// Check if mux is enabled
+    pub fn mux_enabled(&self) -> bool {
+        self.mux.is_some()
     }
 }
 
@@ -307,7 +445,7 @@ impl Runtime {
     }
 
     fn build_outbound(config: &OutboundConfig) -> Result<Outbound> {
-        let keep_alive = config.settings.keep_alive.unwrap_or(false);
+        let mux_enabled = config.settings.mux_enabled.unwrap_or(false);
 
         let transport: Arc<dyn Transport> = match config.protocol.as_str() {
             "blackhole" => Arc::new(BlackholeTransport::new()),
@@ -315,15 +453,8 @@ impl Runtime {
             _ => Arc::new(TcpTransport::new()),
         };
 
-        let pool = if keep_alive {
-            let pool_config = PoolConfig {
-                max_conns_per_host: config.settings.max_idle_conns.unwrap_or(6),
-                idle_timeout: std::time::Duration::from_secs(
-                    config.settings.idle_timeout_secs.unwrap_or(120),
-                ),
-                ..Default::default()
-            };
-            Some(Arc::new(ConnectionPool::new(pool_config)))
+        let mux = if mux_enabled {
+            Some(Arc::new(MuxManager::new()))
         } else {
             None
         };
@@ -348,7 +479,7 @@ impl Runtime {
             server,
             transport,
             pipeline,
-            pool,
+            mux,
         })
     }
 

@@ -181,21 +181,26 @@ impl OutboundPipeline {
     /// Process an outgoing stream through the pipeline.
     ///
     /// Applies StreamLayers (client-side), then Protocol.outbound().
-    pub async fn process(&self, mut stream: Stream, metadata: &Metadata) -> Result<Stream> {
+    pub async fn process(&self, stream: Stream, metadata: &Metadata) -> Result<Stream> {
         trace!("[{}] Processing outbound stream", self.tag);
+        let stream = self.wrap_session_layer(stream).await?;
+        self.protocol_only(stream, metadata).await
+    }
 
-        // Apply stream layers (TLS handshake, WS upgrade, etc.)
+    /// Apply only the session layer (TLS/WS) for reusable base connections.
+    pub async fn wrap_session_layer(&self, mut stream: Stream) -> Result<Stream> {
         if let Some(layer) = &self.layer {
             debug!("[{}] Applying stream layer", self.tag);
             stream = layer.wrap_client(stream).await?;
         }
+        Ok(stream)
+    }
 
-        // Protocol handshake (VMess/SOCKS5 client handshake)
+    /// Run only the protocol handshake on an already layered stream.
+    pub async fn protocol_only(&self, stream: Stream, metadata: &Metadata) -> Result<Stream> {
         debug!("[{}] Protocol handshake ({})", self.tag, self.protocol.name());
         let stream = self.protocol.outbound(stream, metadata).await?;
-
         info!("[{}] Outbound ready", self.tag);
-
         Ok(stream)
     }
 }

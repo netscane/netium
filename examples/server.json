@@ -45,11 +45,7 @@
             "tag": "direct",
             "protocol": "direct",
             "settings": null,
-            "transport": {
-                "keep_alive": true,
-                "max_idle_conns": 10,
-                "idle_timeout_secs": 120
-            }
+            "transport": null
         }
     ],
     "routing": {

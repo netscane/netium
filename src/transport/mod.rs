@@ -18,15 +18,15 @@ mod tcp;
 mod udp;
 mod tls;
 mod websocket;
-mod pool;
 mod null;
+mod mux;
 
 pub use tcp::TcpTransport;
 pub use udp::{Datagram, UdpDatagram, UdpTransport};
 pub use tls::{TlsConfig, TlsWrapper};
 pub use websocket::{WebSocketConfig, WebSocketWrapper};
-pub use pool::{ConnectionPool, PoolConfig, PoolStats};
 pub use null::{BlackholeTransport, RejectTransport};
+pub use mux::MuxManager;
 
 use std::sync::Arc;
 

@@ -109,6 +109,7 @@ impl Config {
                             certificate_file: None,
                             key_file: None,
                         }),
+                        mux_enabled: Some(true),
                         ..Default::default()
                     }),
                 },
@@ -380,17 +381,9 @@ pub struct TransportConfig {
     /// TLS settings
     pub tls_settings: Option<TlsSettings>,
 
-    /// Enable connection pooling / keep-alive (default: true)
+    /// Enable multiplexing (yamux)
     #[serde(default)]
-    pub keep_alive: Option<bool>,
-
-    /// Max idle connections per host (default: 6)
-    #[serde(default)]
-    pub max_idle_conns: Option<usize>,
-
-    /// Idle timeout in seconds (default: 90)
-    #[serde(default)]
-    pub idle_timeout_secs: Option<u64>,
+    pub mux_enabled: Option<bool>,
 }
 
 /// Transport types
