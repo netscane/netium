@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{fmt, EnvFilter};
 
 use netium::config::Config;
 use netium::error::Result;
@@ -30,17 +30,34 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging
+    // Initialize logging with optimizations
     let log_level = std::env::var("RUST_LOG")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(Level::INFO);
     
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level)
+    // Use non-blocking writer for async logging
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
+    
+    // Build optimized filter
+    let filter = EnvFilter::from_default_env()
+        .add_directive(log_level.into());
+    
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(true)
+        .with_level(true)
+        // Disable time formatting to avoid expensive format_time calls
+        .without_time()
+        .with_writer(non_blocking)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+    
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to set tracing subscriber");
+    
+    // Keep the guard alive for the entire runtime
+    std::mem::forget(_guard);
 
     // Load configuration
     let config = if let Some(path) = args.config {

@@ -10,7 +10,6 @@ use aes_gcm::{aead::Aead, Aes128Gcm, KeyInit, Nonce};
 use chacha20poly1305::ChaCha20Poly1305;
 use sha3::{Shake128, digest::{ExtendableOutput, Update, XofReader}};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::debug;
 
 use crate::common::Stream;
 
@@ -353,7 +352,7 @@ impl VmessStream {
                             "response header too large",
                         )));
                     }
-                    debug!("VMess response header length: {}", length);
+                    // Removed debug log for performance
                     self.response_state = ResponseHeaderState::ReadingPayload(
                         DynBufReader::with_capacity(length as usize + 16),
                     );
@@ -381,7 +380,7 @@ impl VmessStream {
                             )));
                         }
                     }
-                    debug!("VMess response header verified");
+                    // Removed debug log for performance
                     self.response_state = ResponseHeaderState::Done;
                 }
             }
@@ -425,7 +424,7 @@ impl VmessStream {
                         }
                         let buf = *reader.data();
                         let (padding, length) = self.decode_length(&buf);
-                        debug!("VMess chunk: length={}, padding={}", length, padding);
+                        // Removed debug log for performance (hot path)
 
                         if length == 0 {
                             return Poll::Ready(Ok(None)); // End of stream marker
@@ -451,7 +450,7 @@ impl VmessStream {
                     self.chunk_state = ChunkReadState::ReadingLength(BufReader::new());
 
                     let decrypted = self.decrypt_chunk(&data, pad)?;
-                    debug!("VMess decrypted {} bytes", decrypted.len());
+                    // Removed debug log for performance (hot path - every chunk)
                     return Poll::Ready(Ok(Some(decrypted)));
                 }
             }

@@ -4,7 +4,7 @@
 
 use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
 use aes::Aes128;
-use aes_gcm::{aead::Aead, Aes128Gcm, KeyInit, Nonce};
+use aes_gcm::{aead::Aead, Aes128Gcm, Nonce};
 use crc32fast::Hasher as Crc32Hasher;
 use hmac::{Hmac, Mac};
 use rand::RngCore;

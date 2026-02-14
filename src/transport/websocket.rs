@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures_util::{Sink, SinkExt, Stream as FuturesStream, StreamExt};
+use futures_util::{Sink, Stream as FuturesStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
     accept_async_with_config,
@@ -15,7 +15,7 @@ use tokio_tungstenite::{
     },
     WebSocketStream,
 };
-use tracing::{debug, trace};
+use tracing::warn;
 
 use crate::common::{Result, Stream};
 use crate::error::Error;
@@ -105,13 +105,13 @@ impl StreamLayer for WebSocketWrapper {
             ..Default::default()
         };
 
-        debug!("WebSocket server: accepting connection on path {}", self.config.path);
+        // Removed debug log for performance
         
         let ws_stream = accept_async_with_config(BoxedStreamWrapper(stream), Some(ws_config))
             .await
             .map_err(|e| Error::Protocol(format!("WebSocket handshake failed: {}", e)))?;
 
-        debug!("WebSocket server: handshake completed");
+        // Removed debug log for performance
         Ok(Box::new(WebSocketStreamWrapper::new(ws_stream)))
     }
 }
@@ -191,7 +191,7 @@ where
         }
 
         if self.closed {
-            trace!("WebSocket poll_read: already closed, returning EOF");
+            // Removed trace log for performance (hot path)
             return Poll::Ready(Ok(()));
         }
 
@@ -199,25 +199,26 @@ where
             Poll::Ready(Some(Ok(msg))) => {
                 let data = match msg {
                     Message::Binary(data) => {
-                        debug!("WebSocket received binary message: {} bytes", data.len());
+                        // Removed debug log for performance (hot path)
                         data
                     }
                     Message::Text(text) => {
-                        debug!("WebSocket received text message: {} bytes", text.len());
+                        // Removed debug log for performance (hot path)
                         text.into_bytes()
                     }
                     Message::Ping(_data) => {
-                        trace!("WebSocket received ping");
+                        // Removed trace log for performance (hot path)
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
                     Message::Pong(_) => {
-                        trace!("WebSocket received pong");
+                        // Removed trace log for performance (hot path)
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
                     Message::Close(frame) => {
-                        debug!("WebSocket received close frame: {:?}", frame);
+                        // Only keep warn-level log for close frames
+                        warn!("WebSocket received close frame: {:?}", frame);
                         self.closed = true;
                         return Poll::Ready(Ok(()));
                     }
@@ -229,7 +230,7 @@ where
                     }
                 };
 
-                debug!("WebSocket data first 32 bytes: {:02x?}", &data[..data.len().min(32)]);
+                // Removed debug log for performance (hot path - every message)
                 
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
@@ -242,7 +243,7 @@ where
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Err(e))) => {
-                debug!("WebSocket read error: {}", e);
+                warn!("WebSocket read error: {}", e);
                 self.closed = true;
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -250,7 +251,7 @@ where
                 )))
             }
             Poll::Ready(None) => {
-                trace!("WebSocket stream ended");
+                // Removed trace log for performance
                 self.closed = true;
                 Poll::Ready(Ok(()))
             }
@@ -269,7 +270,7 @@ where
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if self.closed {
-            debug!("WebSocket poll_write: connection already closed");
+            // Removed debug log for performance (hot path)
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "WebSocket connection closed",
@@ -279,7 +280,7 @@ where
         match Pin::new(&mut self.inner).poll_ready(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => {
-                debug!("WebSocket poll_ready error: {}", e);
+                warn!("WebSocket poll_ready error: {}", e);
                 self.closed = true;
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -289,12 +290,12 @@ where
             Poll::Pending => return Poll::Pending,
         }
 
-        debug!("WebSocket sending {} bytes", buf.len());
+        // Removed debug log for performance (hot path - every write)
         let msg = Message::Binary(buf.to_vec());
         match Pin::new(&mut self.inner).start_send(msg) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => {
-                debug!("WebSocket start_send error: {}", e);
+                warn!("WebSocket start_send error: {}", e);
                 self.closed = true;
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -306,16 +307,16 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if self.closed {
-            debug!("WebSocket poll_flush: already closed");
+            // Removed debug log for performance
             return Poll::Ready(Ok(()));
         }
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Ready(Ok(())) => {
-                debug!("WebSocket poll_flush: success");
+                // Removed debug log for performance (hot path)
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => {
-                debug!("WebSocket poll_flush error: {}", e);
+                warn!("WebSocket poll_flush error: {}", e);
                 self.closed = true;
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -327,7 +328,7 @@ where
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        trace!("WebSocket poll_shutdown called");
+        // Removed trace log for performance
         if self.closed {
             return Poll::Ready(Ok(()));
         }

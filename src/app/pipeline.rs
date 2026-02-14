@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, info, trace};
+use tracing::info;
 
 use crate::common::{Metadata, Result, Stream};
 use crate::protocol::ProxyProtocol;
@@ -73,16 +73,16 @@ impl InboundPipeline {
     ///
     /// Applies StreamLayers (server-side), then Protocol.inbound().
     pub async fn process(&self, mut stream: Stream) -> Result<(Metadata, Stream)> {
-        trace!("[{}] Processing inbound stream", self.tag);
+        // Removed trace log for performance
 
         // Apply stream layers (TLS unwrap, WS decode, etc.)
         if let Some(layer) = &self.layer {
-            debug!("[{}] Applying stream layer", self.tag);
+            // Removed debug log for performance
             stream = layer.wrap_server(stream).await?;
         }
 
         // Parse protocol (SOCKS5/HTTP/VMess handshake)
-        debug!("[{}] Parsing protocol ({})", self.tag, self.protocol.name());
+        // Removed debug log for performance
         let (mut metadata, stream) = self.protocol.inbound(stream).await?;
 
         metadata.inbound_tag = self.tag.clone();
@@ -182,7 +182,7 @@ impl OutboundPipeline {
     ///
     /// Applies StreamLayers (client-side), then Protocol.outbound().
     pub async fn process(&self, stream: Stream, metadata: &Metadata) -> Result<Stream> {
-        trace!("[{}] Processing outbound stream", self.tag);
+        // Removed trace log for performance
         let stream = self.wrap_session_layer(stream).await?;
         self.protocol_only(stream, metadata).await
     }
@@ -190,7 +190,7 @@ impl OutboundPipeline {
     /// Apply only the session layer (TLS/WS) for reusable base connections.
     pub async fn wrap_session_layer(&self, mut stream: Stream) -> Result<Stream> {
         if let Some(layer) = &self.layer {
-            debug!("[{}] Applying stream layer", self.tag);
+            // Removed debug log for performance
             stream = layer.wrap_client(stream).await?;
         }
         Ok(stream)
@@ -198,7 +198,7 @@ impl OutboundPipeline {
 
     /// Run only the protocol handshake on an already layered stream.
     pub async fn protocol_only(&self, stream: Stream, metadata: &Metadata) -> Result<Stream> {
-        debug!("[{}] Protocol handshake ({})", self.tag, self.protocol.name());
+        // Removed debug log for performance
         let stream = self.protocol.outbound(stream, metadata).await?;
         info!("[{}] Outbound ready", self.tag);
         Ok(stream)
