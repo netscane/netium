@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
 
 use crate::common::{Address, Metadata, Network, Result, Stream};
 use crate::error::Error;
@@ -30,12 +29,12 @@ const ADDR_TYPE_DOMAIN: u8 = 0x02;
 const ADDR_TYPE_IPV6: u8 = 0x03;
 
 /// VMess server for inbound connections
-pub struct VmessServer {
-    config: VmessConfig,
+pub struct VmessServer<'a> {
+    config: &'a VmessConfig,
 }
 
-impl VmessServer {
-    pub fn new(config: VmessConfig) -> Self {
+impl<'a> VmessServer<'a> {
+    pub fn new(config: &'a VmessConfig) -> Self {
         Self { config }
     }
 
@@ -54,20 +53,15 @@ impl VmessServer {
 
     /// Accept incoming VMess connection
     pub async fn accept(&self, mut stream: Stream) -> Result<(Metadata, Stream)> {
-        debug!("VMess server accepting connection");
-
         let cmd_key = self.cmd_key();
-        debug!("VMess server: cmd_key={:02x?}, uuid={}", &cmd_key, self.config.uuid);
 
         // Read Auth ID (16 bytes)
         let mut auth_id = [0u8; 16];
         stream.read_exact(&mut auth_id).await?;
-        debug!("VMess server: auth_id={:02x?}", &auth_id);
 
         // Decrypt and validate Auth ID
         let timestamp = open_auth_id(&cmd_key, &auth_id)?;
         self.validate_timestamp(timestamp)?;
-        debug!("VMess server: timestamp={}", timestamp);
 
         // Read encrypted length (18 bytes = 2 + 16 tag)
         let mut encrypted_length = [0u8; 18];
@@ -76,12 +70,10 @@ impl VmessServer {
         // Read connection nonce (8 bytes)
         let mut connection_nonce = [0u8; 8];
         stream.read_exact(&mut connection_nonce).await?;
-        debug!("VMess server: connection_nonce={:02x?}", &connection_nonce);
 
         // Decrypt header length
         let header_length =
             open_aead_request_header_length(&cmd_key, &auth_id, &connection_nonce, &encrypted_length)?;
-        debug!("VMess server: header_length={}", header_length);
 
         if header_length > 2048 {
             return Err(Error::Protocol("Header too large".into()));
@@ -94,16 +86,10 @@ impl VmessServer {
         // Decrypt header payload
         let header =
             open_aead_request_header_payload(&cmd_key, &auth_id, &connection_nonce, &encrypted_payload)?;
-        debug!("VMess server: decrypted header ({} bytes)", header.len());
 
         // Parse header
         let (metadata, request_body_key, request_body_iv, response_header, security, options) =
             self.parse_request_header(&header)?;
-
-        debug!(
-            "VMess server: target={}, security={:?}, options=0x{:02x}",
-            metadata.destination, security, options
-        );
 
         // Calculate response keys (AEAD mode uses SHA256)
         let response_body_key = {
@@ -127,12 +113,10 @@ impl VmessServer {
         // Build response header: [response_header_byte, 0, 0, 0]
         let response_data = vec![response_header, 0, 0, 0];
         let sealed_response = seal_aead_response_header(&response_body_key, &response_body_iv, &response_data)?;
-        debug!("VMess server: sealed response header ({} bytes)", sealed_response.len());
 
         // Send response header
         stream.write_all(&sealed_response).await?;
         stream.flush().await?;
-        debug!("VMess server: response header sent");
 
         // Create VMess stream (server side: read uses request keys, write uses response keys)
         let vmess_stream = VmessStream::server(
@@ -285,11 +269,6 @@ impl VmessServer {
                 expected_hash, actual_hash
             )));
         }
-
-        debug!(
-            "VMess header parsed: version={}, options=0x{:02x}, security={:?}, command={}, addr={}, padding={}",
-            version, options, security, command, address, padding_len
-        );
 
         let metadata = Metadata::new(address)
             .with_network(network)

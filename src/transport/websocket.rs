@@ -15,7 +15,7 @@ use tokio_tungstenite::{
     },
     WebSocketStream,
 };
-use tracing::warn;
+use tracing::debug;
 
 use crate::common::{Result, Stream};
 use crate::error::Error;
@@ -218,7 +218,7 @@ where
                     }
                     Message::Close(frame) => {
                         // Only keep warn-level log for close frames
-                        warn!("WebSocket received close frame: {:?}", frame);
+                        debug!("WebSocket received close frame: {:?}", frame);
                         self.closed = true;
                         return Poll::Ready(Ok(()));
                     }
@@ -243,11 +243,11 @@ where
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Err(e))) => {
-                warn!("WebSocket read error: {}", e);
+                debug!("WebSocket read error: {}", e);
                 self.closed = true;
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    e.to_string(),
+                    e,
                 )))
             }
             Poll::Ready(None) => {
@@ -280,11 +280,11 @@ where
         match Pin::new(&mut self.inner).poll_ready(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => {
-                warn!("WebSocket poll_ready error: {}", e);
+                debug!("WebSocket poll_ready error: {}", e);
                 self.closed = true;
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    e.to_string(),
+                    e,
                 )));
             }
             Poll::Pending => return Poll::Pending,
@@ -295,11 +295,11 @@ where
         match Pin::new(&mut self.inner).start_send(msg) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => {
-                warn!("WebSocket start_send error: {}", e);
+                debug!("WebSocket start_send error: {}", e);
                 self.closed = true;
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    e.to_string(),
+                    e,
                 )))
             }
         }
@@ -316,11 +316,11 @@ where
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => {
-                warn!("WebSocket poll_flush error: {}", e);
+                debug!("WebSocket poll_flush error: {}", e);
                 self.closed = true;
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    e.to_string(),
+                    e,
                 )))
             }
             Poll::Pending => Poll::Pending,

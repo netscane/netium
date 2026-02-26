@@ -34,8 +34,6 @@
 
 use std::sync::Arc;
 
-use tracing::info;
-
 use crate::common::{Metadata, Result, Stream};
 use crate::protocol::ProxyProtocol;
 use crate::transport::{ChainedLayer, StreamLayer};
@@ -48,7 +46,7 @@ use crate::transport::{ChainedLayer, StreamLayer};
 ///
 /// Flow: Stream → [StreamLayer]* → Protocol.inbound() → (Metadata, Stream)
 pub struct InboundPipeline {
-    tag: String,
+    tag: Arc<str>,
     layer: Option<Arc<dyn StreamLayer>>,
     protocol: Arc<dyn ProxyProtocol>,
 }
@@ -85,12 +83,7 @@ impl InboundPipeline {
         // Removed debug log for performance
         let (mut metadata, stream) = self.protocol.inbound(stream).await?;
 
-        metadata.inbound_tag = self.tag.clone();
-
-        info!(
-            "[{}] Inbound: {} -> {} ({})",
-            self.tag, metadata.source, metadata.destination, metadata.protocol
-        );
+        metadata.inbound_tag = Arc::clone(&self.tag);
 
         Ok((metadata, stream))
     }
@@ -142,7 +135,7 @@ impl InboundPipelineBuilder {
     /// Panics if protocol is not set.
     pub fn build(self) -> InboundPipeline {
         InboundPipeline {
-            tag: self.tag,
+            tag: Arc::from(self.tag.as_str()),
             layer: build_layer_chain(self.layers),
             protocol: self.protocol.expect("protocol is required"),
         }
@@ -198,9 +191,7 @@ impl OutboundPipeline {
 
     /// Run only the protocol handshake on an already layered stream.
     pub async fn protocol_only(&self, stream: Stream, metadata: &Metadata) -> Result<Stream> {
-        // Removed debug log for performance
         let stream = self.protocol.outbound(stream, metadata).await?;
-        info!("[{}] Outbound ready", self.tag);
         Ok(stream)
     }
 }

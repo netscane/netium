@@ -296,7 +296,6 @@ impl Outbound {
         // Mux path: get a stream from mux session
         if let Some(mux) = &self.mux {
             let key = target.to_string();
-            debug!("[{}] Using mux for {}", self.tag, target);
             
             let dial = || async {
                 let base_stream = self.transport.connect(target).await?;
@@ -308,7 +307,6 @@ impl Outbound {
         }
 
         // Direct connection without mux
-        debug!("[{}] Connecting to {}", self.tag, target);
         let stream = self.transport.connect(target).await?;
         self.pipeline.process(stream, metadata).await
     }
@@ -633,6 +631,7 @@ async fn run_inbound(
     );
 
     let mut conn_count: u64 = 0;
+    let mut accept_err_count: u64 = 0;
 
     loop {
         tokio::select! {
@@ -640,7 +639,6 @@ async fn run_inbound(
                 match result {
                     Ok((stream, source)) => {
                         conn_count += 1;
-                        debug!("[{}] Connection #{} from {}", inbound.tag, conn_count, source);
 
                         if let Some(stat) = &inbound_stat {
                             stat.connection_accepted();
@@ -652,7 +650,6 @@ async fn run_inbound(
                         let conn_id = conn_count;
 
                         tokio::spawn(async move {
-                            // Pipeline processes the stream
                             let result = async {
                                 let (mut metadata, stream) = inbound.pipeline.process(stream).await?;
                                 metadata.source = source.clone();
@@ -664,12 +661,19 @@ async fn run_inbound(
                             }
 
                             if let Err(e) = result {
-                                warn!("Connection #{} from {} error: {}", conn_id, source, e);
+                                debug!("Connection #{} from {} error: {}", conn_id, source, e);
                             }
                         });
                     }
                     Err(e) => {
-                        error!("[{}] Accept error: {}", inbound.tag, e);
+                        accept_err_count += 1;
+                        // Rate-limit error logging: log first, then every 100th
+                        if accept_err_count == 1 || accept_err_count % 100 == 0 {
+                            error!(
+                                "[{}] Accept error (count={}): {}",
+                                inbound.tag, accept_err_count, e
+                            );
+                        }
                     }
                 }
             }

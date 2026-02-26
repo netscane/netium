@@ -261,7 +261,8 @@ impl VmessStream {
 
         match self.security {
             Security::Aes128Gcm => {
-                let ct = self.aead_encrypt::<Aes128Gcm>(&self.write_ctx.key.clone(), data)?;
+                let key = self.write_ctx.key;
+                let ct = self.aead_encrypt::<Aes128Gcm>(&key, data)?;
                 chunk.extend_from_slice(&ct);
             }
             Security::Chacha20Poly1305 => {
@@ -297,7 +298,8 @@ impl VmessStream {
                 if ct_len < TAG_SIZE {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "ciphertext too short"));
                 }
-                self.aead_decrypt::<Aes128Gcm>(&self.read_ctx.key.clone(), &data[..ct_len])
+                let key = self.read_ctx.key;
+                self.aead_decrypt::<Aes128Gcm>(&key, &data[..ct_len])
             }
             Security::Chacha20Poly1305 => {
                 if ct_len < TAG_SIZE {

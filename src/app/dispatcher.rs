@@ -17,11 +17,12 @@
 //! Each connection is handled in a separate tokio task.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::common::{Metadata, Result, Stream};
 use crate::error::Error;
@@ -154,7 +155,7 @@ impl Dispatcher {
             }
         };
 
-        info!(
+        debug!(
             "[{}] {} -> {} via [{}]",
             metadata.inbound_tag, metadata.source, metadata.destination, outbound_tag
         );
@@ -165,13 +166,13 @@ impl Dispatcher {
         conn_metrics.record_completion();
         self.record_connection_end(up, down, &outbound_stat);
 
-        info!(
+        debug!(
             "[{}] Closed: {} -> {} (↑{} ↓{} {:?})",
             metadata.inbound_tag,
             metadata.source,
             metadata.destination,
-            format_bytes(up),
-            format_bytes(down),
+            BytesDisplay(up),
+            BytesDisplay(down),
             start.elapsed()
         );
 
@@ -206,8 +207,9 @@ async fn relay_with_metrics(
     let (mut in_read, mut in_write) = tokio::io::split(inbound);
     let (mut out_read, mut out_write) = tokio::io::split(outbound);
 
-    let tag_up = outbound_tag.to_string();
-    let tag_down = outbound_tag.to_string();
+    let tag: Arc<str> = Arc::from(outbound_tag);
+    let tag_up = Arc::clone(&tag);
+    let tag_down = tag;
 
     // Upload: client → server
     let upload = async move {
@@ -277,19 +279,24 @@ async fn relay_with_metrics(
 // Utilities
 // ============================================================================
 
-/// Format bytes in human-readable form
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
+/// Zero-allocation bytes display wrapper
+struct BytesDisplay(u64);
 
-    if bytes >= GB {
-        format!("{:.2}GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2}MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2}KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{}B", bytes)
+impl fmt::Display for BytesDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+
+        let bytes = self.0;
+        if bytes >= GB {
+            write!(f, "{:.2}GB", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            write!(f, "{:.2}MB", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            write!(f, "{:.2}KB", bytes as f64 / KB as f64)
+        } else {
+            write!(f, "{}B", bytes)
+        }
     }
 }

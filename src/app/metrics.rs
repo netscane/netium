@@ -177,15 +177,15 @@ pub fn init_metrics() {
 }
 
 /// Helper struct for tracking a single connection's metrics
-pub struct ConnectionMetrics {
-    outbound_tag: String,
+pub struct ConnectionMetrics<'a> {
+    outbound_tag: &'a str,
     start_time: std::time::Instant,
 }
 
-impl ConnectionMetrics {
-    pub fn new(outbound_tag: &str) -> Self {
+impl<'a> ConnectionMetrics<'a> {
+    pub fn new(outbound_tag: &'a str) -> Self {
         Self {
-            outbound_tag: outbound_tag.to_string(),
+            outbound_tag,
             start_time: std::time::Instant::now(),
         }
     }

@@ -2,6 +2,8 @@
 //!
 //! Router ONLY depends on Metadata, never on Stream or IO.
 
+use std::sync::Arc;
+
 use super::Address;
 
 /// Network type
@@ -37,7 +39,7 @@ pub struct Metadata {
     /// Network type (TCP/UDP)
     pub network: Network,
     /// Inbound tag for routing decisions
-    pub inbound_tag: String,
+    pub inbound_tag: Arc<str>,
     /// Protocol name (vmess, vless, socks, http, direct)
     pub protocol: String,
 }
@@ -49,7 +51,7 @@ impl Metadata {
             source: Address::unspecified(),
             destination,
             network: Network::Tcp,
-            inbound_tag: String::new(),
+            inbound_tag: Arc::from(""),
             protocol: String::new(),
         }
     }
@@ -68,7 +70,8 @@ impl Metadata {
 
     /// Builder: set inbound tag
     pub fn with_inbound_tag(mut self, tag: impl Into<String>) -> Self {
-        self.inbound_tag = tag.into();
+        let s: String = tag.into();
+        self.inbound_tag = Arc::from(s.as_str());
         self
     }
 
@@ -85,7 +88,7 @@ impl Default for Metadata {
             source: Address::unspecified(),
             destination: Address::unspecified(),
             network: Network::Tcp,
-            inbound_tag: String::new(),
+            inbound_tag: Arc::from(""),
             protocol: String::new(),
         }
     }

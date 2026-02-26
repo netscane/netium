@@ -113,12 +113,12 @@ impl VmessProtocol {
 #[async_trait]
 impl ProxyProtocol for VmessProtocol {
     async fn inbound(&self, stream: Stream) -> Result<(Metadata, Stream)> {
-        let server = VmessServer::new(self.config.clone());
+        let server = VmessServer::new(&self.config);
         server.accept(stream).await
     }
 
     async fn outbound(&self, stream: Stream, metadata: &Metadata) -> Result<Stream> {
-        let client = VmessClient::new(self.config.clone());
+        let client = VmessClient::new(&self.config);
         client.connect(stream, metadata).await
     }
 

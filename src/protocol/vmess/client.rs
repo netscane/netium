@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 
 use sha2::{Sha256, Digest};
 use rand::RngCore;
-use tracing::debug;
 
 use crate::common::{Address, Metadata, Network, Result, Stream};
 use crate::error::Error;
@@ -30,12 +29,12 @@ const ADDR_TYPE_DOMAIN: u8 = 0x02;
 const ADDR_TYPE_IPV6: u8 = 0x03;
 
 /// VMess client for outbound connections
-pub struct VmessClient {
-    config: VmessConfig,
+pub struct VmessClient<'a> {
+    config: &'a VmessConfig,
 }
 
-impl VmessClient {
-    pub fn new(config: VmessConfig) -> Self {
+impl<'a> VmessClient<'a> {
+    pub fn new(config: &'a VmessConfig) -> Self {
         Self { config }
     }
 
@@ -56,10 +55,7 @@ impl VmessClient {
 
     /// Connect to target through VMess protocol
     pub async fn connect(&self, stream: Stream, metadata: &Metadata) -> Result<Stream> {
-        debug!("VMess connecting to {}", metadata.destination);
-
         let cmd_key = self.cmd_key();
-        debug!("VMess client: cmd_key={:02x?}, uuid={}", &cmd_key, self.config.uuid);
 
         // Generate random keys
         let mut request_body_key = [0u8; 16];
@@ -69,11 +65,6 @@ impl VmessClient {
         rand::thread_rng().fill_bytes(&mut request_body_key);
         rand::thread_rng().fill_bytes(&mut request_body_iv);
         rand::thread_rng().fill_bytes(&mut response_header);
-        
-        debug!(
-            "VMess keys: body_key={:02x?}, body_iv={:02x?}, resp_header={}",
-            &request_body_key[..], &request_body_iv[..], response_header[0]
-        );
 
         // Calculate response keys (AEAD mode uses SHA256)
         let response_body_key = {
@@ -101,23 +92,12 @@ impl VmessClient {
             &request_body_iv,
             response_header[0],
         )?;
-        
-        debug!("VMess request header ({} bytes): {:02x?}", header.len(), &header);
 
-        // Seal header with AEAD (use cmd_key computed earlier)
+        // Seal header with AEAD
         let sealed_header = seal_vmess_aead_header(&cmd_key, &header)?;
 
-        debug!("VMess sealed header: {} bytes", sealed_header.len());
-
         // Wrap stream with VMess encryption
-        // Header will be sent together with first payload (like v2ray's BufferedWriter)
-        // Response header will be read lazily on first read
         let security = self.config.security.resolve();
-        
-        debug!(
-            "VMess stream keys: request_key={:02x?}, request_iv={:02x?}",
-            &request_body_key[..8], &request_body_iv[..8]
-        );
         
         let vmess_stream = VmessStream::client(
             stream,
@@ -131,9 +111,6 @@ impl VmessClient {
         );
 
         // Note: Response header will be read on first read from the stream
-        // This matches v2ray's behavior where request and response are handled concurrently
-        debug!("VMess stream created with pending header, response will be read on first read");
-
         Ok(Box::new(vmess_stream))
     }
 
@@ -180,15 +157,11 @@ impl VmessClient {
             options |= REQUEST_OPTION_GLOBAL_PADDING;
         }
         buf.push(options);
-        
-        debug!("VMess header: version={}, options=0x{:02x}, security={:?}", VMESS_VERSION, options, security);
 
         // Padding length (4 bits) + Security (4 bits)
         let padding_len = rand::random::<u8>() % 16;
         let security_byte = (padding_len << 4) | security.to_byte();
         buf.push(security_byte);
-        
-        debug!("VMess header: padding_len={}, security_byte=0x{:02x}", padding_len, security_byte);
 
         // Reserved (1 byte)
         buf.push(0);
@@ -199,8 +172,6 @@ impl VmessClient {
             Network::Udp => COMMAND_UDP,
         };
         buf.push(command);
-        
-        debug!("VMess header: command={} ({})", command, if command == 1 { "TCP" } else { "UDP" });
 
         // Address
         self.write_address(&mut buf, &metadata.destination)?;
@@ -215,8 +186,6 @@ impl VmessClient {
         // FNV1a hash (4 bytes)
         let hash = fnv1a_hash(&buf);
         buf.extend_from_slice(&hash.to_be_bytes());
-        
-        debug!("VMess header: fnv_hash=0x{:08x}, total_len={}", hash, buf.len());
 
         Ok(buf)
     }

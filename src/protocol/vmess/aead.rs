@@ -10,7 +10,6 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::debug;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -174,20 +173,15 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
         .map_err(|e| Error::Protocol(format!("Time error: {}", e)))?
         .as_secs() as i64;
 
-    debug!("VMess AEAD: timestamp={}", timestamp);
-
     let auth_id = create_auth_id(cmd_key, timestamp);
-    debug!("VMess AEAD: auth_id={:02x?}", &auth_id);
 
     // Generate connection nonce (8 bytes)
     let mut connection_nonce = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut connection_nonce);
-    debug!("VMess AEAD: connection_nonce={:02x?}", &connection_nonce);
 
     // Encrypt payload length
     let payload_length = data.len() as u16;
     let length_bytes = payload_length.to_be_bytes();
-    debug!("VMess AEAD: payload_length={}", payload_length);
 
     let length_key = kdf16(
         cmd_key,
@@ -205,7 +199,6 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
             &connection_nonce,
         ],
     );
-    debug!("VMess AEAD length: key={:02x?}, iv={:02x?}", &length_key, &length_iv[..12]);
 
     let length_cipher = Aes128Gcm::new_from_slice(&length_key)
         .map_err(|e| Error::Crypto(format!("Failed to create cipher: {}", e)))?;
@@ -220,7 +213,6 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
             },
         )
         .map_err(|e| Error::Crypto(format!("Encryption failed: {}", e)))?;
-    debug!("VMess AEAD: encrypted_length ({} bytes)={:02x?}", encrypted_length.len(), &encrypted_length);
 
     // Encrypt payload
     let payload_key = kdf16(
@@ -239,7 +231,6 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
             &connection_nonce,
         ],
     );
-    debug!("VMess AEAD payload: key={:02x?}, iv={:02x?}", &payload_key, &payload_iv[..12]);
 
     let payload_cipher = Aes128Gcm::new_from_slice(&payload_key)
         .map_err(|e| Error::Crypto(format!("Failed to create cipher: {}", e)))?;
@@ -254,7 +245,6 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
             },
         )
         .map_err(|e| Error::Crypto(format!("Encryption failed: {}", e)))?;
-    debug!("VMess AEAD: encrypted_payload ({} bytes)", encrypted_payload.len());
 
     // Build output: auth_id (16) + encrypted_length (2+16) + nonce (8) + encrypted_payload
     let mut output = Vec::with_capacity(16 + 18 + 8 + encrypted_payload.len());
@@ -262,8 +252,6 @@ pub fn seal_vmess_aead_header(cmd_key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
     output.extend_from_slice(&encrypted_length);
     output.extend_from_slice(&connection_nonce);
     output.extend_from_slice(&encrypted_payload);
-
-    debug!("VMess AEAD: total output {} bytes (16 + 18 + 8 + {})", output.len(), encrypted_payload.len());
 
     Ok(output)
 }

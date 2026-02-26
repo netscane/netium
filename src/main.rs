@@ -46,10 +46,14 @@ fn main() -> Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(filter)
         .with_target(false)
-        .with_ansi(true)
+        .with_ansi(false)
         .with_level(true)
-        // Disable time formatting to avoid expensive format_time calls
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(false)
+        .with_line_number(false)
         .without_time()
+        .compact()
         .with_writer(non_blocking)
         .finish();
     

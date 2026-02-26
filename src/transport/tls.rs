@@ -44,16 +44,20 @@ impl Default for TlsConfig {
 
 /// TLS wrapper for encrypting streams
 pub struct TlsWrapper {
-    config: TlsConfig,
     connector: TlsConnector,
     acceptor: Option<TlsAcceptor>,
+    /// Pre-built server name for client connections (avoids per-connection clone + parse)
+    cached_server_name: Option<ServerName<'static>>,
 }
 
 impl TlsWrapper {
     pub fn new(config: TlsConfig) -> Self {
         let connector = Self::build_connector(&config);
         let acceptor = Self::build_acceptor(&config);
-        Self { config, connector, acceptor }
+        let cached_server_name = config.server_name.as_ref().and_then(|name| {
+            ServerName::try_from(name.clone()).ok()
+        });
+        Self { connector, acceptor, cached_server_name }
     }
 
     fn build_connector(config: &TlsConfig) -> TlsConnector {
@@ -131,14 +135,8 @@ impl TlsWrapper {
 #[async_trait]
 impl StreamLayer for TlsWrapper {
     async fn wrap_client(&self, stream: Stream) -> Result<Stream> {
-        let server_name = self
-            .config
-            .server_name
-            .as_ref()
+        let domain = self.cached_server_name.clone()
             .ok_or_else(|| Error::Config("TLS server name required".into()))?;
-
-        let domain = ServerName::try_from(server_name.clone())
-            .map_err(|_| Error::Config(format!("Invalid server name: {}", server_name)))?;
 
         let tls_stream = self.connector.connect(domain, BoxedStreamWrapper(stream)).await?;
         Ok(Box::new(tls_stream))

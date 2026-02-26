@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use regex::Regex;
+
 use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_DURATION, ROUTER_RULE_MATCH_MAX, ROUTER_DECISIONS_TOTAL};
 use crate::common::{Address, Metadata, Network};
 use crate::geoip::GeoIpMatcher;
@@ -109,12 +111,28 @@ pub struct RuleStatsSnapshot {
     pub total_match_time_us: f64,
 }
 
+/// Compiled domain pattern for efficient matching
+enum CompiledDomainPattern {
+    GeoSite(String),
+    /// domain: suffix match (stores ".target" for ends_with check)
+    DomainSuffix { exact: String, suffix: String },
+    Full(String),
+    Regexp(Regex),
+    Keyword(String),
+    /// Plain substring match
+    Plain(String),
+}
+
 /// Rule-based router
 pub struct RuleRouter {
     rules: Vec<Rule>,
     default_outbound: String,
     geosite: GeoSiteMatcher,
     geoip: GeoIpMatcher,
+    /// Pre-compiled domain patterns for each rule (same index as rules)
+    compiled_domains: Vec<Vec<CompiledDomainPattern>>,
+    /// Pre-computed Prometheus label strings (same index as rules + "default")
+    rule_labels: Vec<String>,
     /// Statistics for each rule (same index as rules)
     stats: Arc<Vec<RuleStat>>,
     /// Hits for default outbound (no rule matched)
@@ -124,14 +142,56 @@ pub struct RuleRouter {
 impl RuleRouter {
     pub fn new(rules: Vec<Rule>, default_outbound: impl Into<String>) -> Self {
         let stats: Vec<RuleStat> = rules.iter().map(|_| RuleStat::default()).collect();
+
+        // Pre-compute Prometheus labels: "rule_1", "rule_2", ...
+        let rule_labels: Vec<String> = (0..rules.len())
+            .map(|i| format!("rule_{}", i + 1))
+            .collect();
+
+        // Pre-compile domain patterns for each rule
+        let compiled_domains: Vec<Vec<CompiledDomainPattern>> = rules
+            .iter()
+            .map(|rule| Self::compile_domain_patterns(&rule.domain))
+            .collect();
+
         Self {
             rules,
             default_outbound: default_outbound.into(),
             geosite: GeoSiteMatcher::new(),
             geoip: GeoIpMatcher::default(),
+            compiled_domains,
+            rule_labels,
             stats: Arc::new(stats),
             default_hits: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Compile domain patterns at construction time
+    fn compile_domain_patterns(patterns: &[String]) -> Vec<CompiledDomainPattern> {
+        patterns
+            .iter()
+            .filter_map(|pattern| {
+                if let Some(site) = pattern.strip_prefix("geosite:") {
+                    Some(CompiledDomainPattern::GeoSite(site.to_string()))
+                } else if let Some(target) = pattern.strip_prefix("domain:") {
+                    Some(CompiledDomainPattern::DomainSuffix {
+                        exact: target.to_string(),
+                        suffix: format!(".{}", target),
+                    })
+                } else if let Some(target) = pattern.strip_prefix("full:") {
+                    Some(CompiledDomainPattern::Full(target.to_string()))
+                } else if let Some(regex_str) = pattern.strip_prefix("regexp:") {
+                    match Regex::new(regex_str) {
+                        Ok(re) => Some(CompiledDomainPattern::Regexp(re)),
+                        Err(_) => None, // skip invalid regex
+                    }
+                } else if let Some(keyword) = pattern.strip_prefix("keyword:") {
+                    Some(CompiledDomainPattern::Keyword(keyword.to_string()))
+                } else {
+                    Some(CompiledDomainPattern::Plain(pattern.clone()))
+                }
+            })
+            .collect()
     }
 
     pub fn with_geosite(mut self, geosite: GeoSiteMatcher) -> Self {
@@ -245,10 +305,10 @@ impl RuleRouter {
     }
 
     /// Check if a rule matches the metadata
-    fn match_rule(&self, rule: &Rule, metadata: &Metadata) -> bool {
+    fn match_rule(&self, rule_idx: usize, rule: &Rule, metadata: &Metadata) -> bool {
         // Check inbound tag
         if !rule.inbound_tag.is_empty()
-            && !rule.inbound_tag.iter().any(|t| t == &metadata.inbound_tag)
+            && !rule.inbound_tag.iter().any(|t| t.as_str() == &*metadata.inbound_tag)
         {
             return false;
         }
@@ -300,7 +360,8 @@ impl RuleRouter {
         }
 
         // Check domain/IP for Field type
-        let has_domain_rules = !rule.domain.is_empty();
+        let compiled = &self.compiled_domains[rule_idx];
+        let has_domain_rules = !compiled.is_empty();
         let has_ip_rules = !rule.ip.is_empty();
 
         if !has_domain_rules && !has_ip_rules {
@@ -310,7 +371,7 @@ impl RuleRouter {
         match &metadata.destination {
             Address::Domain(domain, _) => {
                 if has_domain_rules {
-                    self.match_domain(&rule.domain, domain)
+                    self.match_domain_compiled(compiled, domain)
                 } else {
                     false
                 }
@@ -369,42 +430,41 @@ impl RuleRouter {
         false
     }
 
-    /// Match domain patterns
-    fn match_domain(&self, patterns: &[String], domain: &str) -> bool {
+    /// Match domain against pre-compiled patterns
+    fn match_domain_compiled(&self, patterns: &[CompiledDomainPattern], domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
 
         for pattern in patterns {
-            if pattern.starts_with("geosite:") {
-                let site = &pattern[8..];
-                if self.geosite.matches(site, &domain_lower) {
-                    return true;
+            match pattern {
+                CompiledDomainPattern::GeoSite(site) => {
+                    if self.geosite.matches(site, &domain_lower) {
+                        return true;
+                    }
                 }
-            } else if pattern.starts_with("domain:") {
-                let target = &pattern[7..];
-                if domain_lower == target || domain_lower.ends_with(&format!(".{}", target)) {
-                    return true;
+                CompiledDomainPattern::DomainSuffix { exact, suffix } => {
+                    if domain_lower == *exact || domain_lower.ends_with(suffix.as_str()) {
+                        return true;
+                    }
                 }
-            } else if pattern.starts_with("full:") {
-                let target = &pattern[5..];
-                if domain_lower == target {
-                    return true;
+                CompiledDomainPattern::Full(target) => {
+                    if domain_lower == *target {
+                        return true;
+                    }
                 }
-            } else if pattern.starts_with("regexp:") {
-                let regex_str = &pattern[7..];
-                if let Ok(re) = regex::Regex::new(regex_str) {
+                CompiledDomainPattern::Regexp(re) => {
                     if re.is_match(&domain_lower) {
                         return true;
                     }
                 }
-            } else if pattern.starts_with("keyword:") {
-                let keyword = &pattern[8..];
-                if domain_lower.contains(keyword) {
-                    return true;
+                CompiledDomainPattern::Keyword(keyword) => {
+                    if domain_lower.contains(keyword.as_str()) {
+                        return true;
+                    }
                 }
-            } else {
-                // Plain domain match (substring)
-                if domain_lower.contains(pattern) {
-                    return true;
+                CompiledDomainPattern::Plain(p) => {
+                    if domain_lower.contains(p.as_str()) {
+                        return true;
+                    }
                 }
             }
         }
@@ -450,7 +510,7 @@ impl Router for RuleRouter {
         
         for (i, rule) in self.rules.iter().enumerate() {
             let start = Instant::now();
-            let matched = self.match_rule(rule, metadata);
+            let matched = self.match_rule(i, rule, metadata);
             let elapsed = start.elapsed();
             let elapsed_ns = elapsed.as_nanos() as u64;
             
@@ -458,15 +518,15 @@ impl Router for RuleRouter {
             self.stats[i].match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
             self.stats[i].eval_count.fetch_add(1, Ordering::Relaxed);
             
-            // Record to Prometheus
-            let rule_label = format!("rule_{}", i + 1);
+            // Record to Prometheus using pre-computed label
+            let rule_label = &self.rule_labels[i];
             let elapsed_secs = elapsed.as_secs_f64();
             ROUTER_RULE_MATCH_DURATION
-                .with_label_values(&[&rule_label])
+                .with_label_values(&[rule_label])
                 .observe(elapsed_secs);
             
             // Update max if this is larger
-            let max_gauge = ROUTER_RULE_MATCH_MAX.with_label_values(&[&rule_label]);
+            let max_gauge = ROUTER_RULE_MATCH_MAX.with_label_values(&[rule_label]);
             let current_max = max_gauge.get();
             if elapsed_secs > current_max {
                 max_gauge.set(elapsed_secs);
@@ -475,7 +535,7 @@ impl Router for RuleRouter {
             if matched {
                 // Record hit
                 self.stats[i].hits.fetch_add(1, Ordering::Relaxed);
-                ROUTER_RULE_HITS.with_label_values(&[&rule_label]).inc();
+                ROUTER_RULE_HITS.with_label_values(&[rule_label]).inc();
                 return &rule.outbound_tag;
             }
         }
@@ -498,6 +558,8 @@ impl Default for RuleRouter {
             default_outbound: "direct".to_string(),
             geosite: GeoSiteMatcher::new(),
             geoip: GeoIpMatcher::new(),
+            compiled_domains: vec![],
+            rule_labels: vec![],
             stats: Arc::new(vec![]),
             default_hits: Arc::new(AtomicU64::new(0)),
         }
