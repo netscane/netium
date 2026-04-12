@@ -5,6 +5,9 @@ edition = "2021"
 description = "A modern VPN/proxy tool inspired by V2Ray"
 license = "MIT"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

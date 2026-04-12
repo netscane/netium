@@ -44,14 +44,15 @@ impl DomainEntry {
         match self {
             DomainEntry::Domain(s) => {
                 // Suffix match: matches domain and all subdomains
-                domain_lower == *s || domain_lower.ends_with(&format!(".{}", s))
+                domain_lower == *s
+                    || (domain_lower.len() > s.len()
+                        && domain_lower.ends_with(s.as_str())
+                        && domain_lower.as_bytes()[domain_lower.len() - s.len() - 1] == b'.')
             }
             DomainEntry::Full(s) => {
-                // Exact match only
                 domain_lower == *s
             }
             DomainEntry::Keyword(s) => {
-                // Substring/keyword match
                 domain_lower.contains(s)
             }
             DomainEntry::Regex(pattern) => {
@@ -65,13 +66,14 @@ impl DomainEntry {
     }
 
     /// Check if domain matches this entry, treating Full as Domain (suffix match)
-    /// This is useful for matching subdomains of exact-match entries
     pub fn matches_as_suffix(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
         match self {
             DomainEntry::Domain(s) | DomainEntry::Full(s) => {
-                // Treat Full as Domain (suffix match)
-                domain_lower == *s || domain_lower.ends_with(&format!(".{}", s))
+                domain_lower == *s
+                    || (domain_lower.len() > s.len()
+                        && domain_lower.ends_with(s.as_str())
+                        && domain_lower.as_bytes()[domain_lower.len() - s.len() - 1] == b'.')
             }
             DomainEntry::Keyword(s) => domain_lower.contains(s),
             DomainEntry::Regex(pattern) => {

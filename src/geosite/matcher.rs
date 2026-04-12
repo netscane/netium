@@ -12,39 +12,44 @@ use crate::error::Result;
 use super::GeoSite;
 
 /// Default cache size for domain lookups
-const DEFAULT_CACHE_SIZE: usize = 4096;
-
-/// Cache entry for is_china_domain results
-#[derive(Clone, Copy)]
-struct CacheEntry {
-    is_china: bool,
-}
+const DEFAULT_CACHE_SIZE: usize = 8192;
 
 /// Thread-safe GeoSite matcher with LRU cache
 #[derive(Clone)]
 pub struct GeoSiteMatcher {
     geosite: Arc<GeoSite>,
+    /// LRU cache for general matches: (site, domain) -> matched
+    match_cache: Arc<Mutex<LruCache<(String, String), bool>>>,
     /// LRU cache for is_china_domain results: domain -> is_china
-    china_cache: Arc<Mutex<LruCache<String, CacheEntry>>>,
+    china_cache: Arc<Mutex<LruCache<String, bool>>>,
 }
 
 impl GeoSiteMatcher {
+    fn new_caches(size: usize) -> (Arc<Mutex<LruCache<(String, String), bool>>>, Arc<Mutex<LruCache<String, bool>>>) {
+        let cap = NonZeroUsize::new(size.max(1)).unwrap();
+        (
+            Arc::new(Mutex::new(LruCache::new(cap))),
+            Arc::new(Mutex::new(LruCache::new(cap))),
+        )
+    }
+
     /// Create with builtin sites
     pub fn new() -> Self {
+        let (match_cache, china_cache) = Self::new_caches(DEFAULT_CACHE_SIZE);
         Self {
             geosite: Arc::new(GeoSite::with_builtin()),
-            china_cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
-            ))),
+            match_cache,
+            china_cache,
         }
     }
 
     /// Create with custom cache size
     pub fn with_cache_size(cache_size: usize) -> Self {
-        let size = NonZeroUsize::new(cache_size.max(1)).unwrap();
+        let (match_cache, china_cache) = Self::new_caches(cache_size);
         Self {
             geosite: Arc::new(GeoSite::with_builtin()),
-            china_cache: Arc::new(Mutex::new(LruCache::new(size))),
+            match_cache,
+            china_cache,
         }
     }
 
@@ -62,11 +67,11 @@ impl GeoSiteMatcher {
             }
         }
         
+        let (match_cache, china_cache) = Self::new_caches(DEFAULT_CACHE_SIZE);
         Ok(Self {
             geosite: Arc::new(geosite),
-            china_cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
-            ))),
+            match_cache,
+            china_cache,
         })
     }
 
@@ -84,27 +89,47 @@ impl GeoSiteMatcher {
             }
         }
         
+        let (match_cache, china_cache) = Self::new_caches(DEFAULT_CACHE_SIZE);
         Ok(Self {
             geosite: Arc::new(geosite),
-            china_cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
-            ))),
+            match_cache,
+            china_cache,
         })
     }
 
     /// Load from default locations or use builtin
     pub fn load_default() -> Self {
+        let (match_cache, china_cache) = Self::new_caches(DEFAULT_CACHE_SIZE);
         Self {
             geosite: Arc::new(GeoSite::load_default()),
-            china_cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
-            ))),
+            match_cache,
+            china_cache,
         }
     }
 
-    /// Check if domain matches a geosite
+    /// Check if domain matches a geosite (with LRU cache)
     pub fn matches(&self, site: &str, domain: &str) -> bool {
-        self.geosite.matches(site, domain)
+        let site_lower = site.to_lowercase();
+        let domain_lower = domain.to_lowercase();
+        let key = (site_lower, domain_lower);
+
+        // Check cache
+        {
+            let mut cache = self.match_cache.lock().unwrap();
+            if let Some(&result) = cache.get(&key) {
+                return result;
+            }
+        }
+
+        let result = self.geosite.matches(&key.0, &key.1);
+
+        // Store in cache
+        {
+            let mut cache = self.match_cache.lock().unwrap();
+            cache.put(key, result);
+        }
+
+        result
     }
 
     /// Check if domain matches a geosite, treating Full entries as suffix match
@@ -125,8 +150,8 @@ impl GeoSiteMatcher {
         // Check cache first
         {
             let mut cache = self.china_cache.lock().unwrap();
-            if let Some(entry) = cache.get(&domain_lower) {
-                return entry.is_china;
+            if let Some(&is_china) = cache.get(&domain_lower) {
+                return is_china;
             }
         }
         
@@ -136,23 +161,29 @@ impl GeoSiteMatcher {
         // Store in cache
         {
             let mut cache = self.china_cache.lock().unwrap();
-            cache.put(domain_lower, CacheEntry { is_china });
+            cache.put(domain_lower, is_china);
         }
         
         is_china
     }
 
-    /// Get cache statistics
+    /// Get cache statistics: (china_cache_len, match_cache_len, capacity)
     pub fn cache_stats(&self) -> (usize, usize) {
-        let cache = self.china_cache.lock().unwrap();
+        let china = self.china_cache.lock().unwrap();
+        (china.len(), china.cap().get())
+    }
+
+    /// Get match cache statistics
+    pub fn match_cache_stats(&self) -> (usize, usize) {
+        let cache = self.match_cache.lock().unwrap();
         (cache.len(), cache.cap().get())
     }
 
-    /// Clear the cache
+    /// Clear all caches
     pub fn clear_cache(&self) {
-        let mut cache = self.china_cache.lock().unwrap();
-        cache.clear();
-        debug!("GeoSite cache cleared");
+        self.china_cache.lock().unwrap().clear();
+        self.match_cache.lock().unwrap().clear();
+        debug!("GeoSite caches cleared");
     }
 
     /// List available sites
