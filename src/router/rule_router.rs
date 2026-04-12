@@ -530,24 +530,25 @@ impl RuleRouter {
 impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
         ROUTER_DECISIONS_TOTAL.inc();
-        let start = Instant::now();
 
         for (i, rule) in self.rules.iter().enumerate() {
+            let start = Instant::now();
             let matched = self.match_rule(i, rule, metadata);
+            let elapsed = start.elapsed();
+            let elapsed_ns = elapsed.as_nanos() as u64;
+
+            self.stats[i].match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
             self.stats[i].eval_count.fetch_add(1, Ordering::Relaxed);
 
-            if matched {
-                let elapsed = start.elapsed();
-                let elapsed_ns = elapsed.as_nanos() as u64;
-                self.stats[i].match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-                self.stats[i].hits.fetch_add(1, Ordering::Relaxed);
+            let handles = &self.metric_handles[i];
+            let elapsed_secs = elapsed.as_secs_f64();
+            handles.duration.observe(elapsed_secs);
+            if elapsed_secs > handles.max_gauge.get() {
+                handles.max_gauge.set(elapsed_secs);
+            }
 
-                let handles = &self.metric_handles[i];
-                let elapsed_secs = elapsed.as_secs_f64();
-                handles.duration.observe(elapsed_secs);
-                if elapsed_secs > handles.max_gauge.get() {
-                    handles.max_gauge.set(elapsed_secs);
-                }
+            if matched {
+                self.stats[i].hits.fetch_add(1, Ordering::Relaxed);
                 handles.hits.inc();
                 return &rule.outbound_tag;
             }
