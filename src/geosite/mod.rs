@@ -121,11 +121,11 @@ pub struct GeoSite {
     /// Matches "bilibili.com" and "*.bilibili.com"
     suffix_index: HashMap<String, HashSet<String>>,
     
-    /// Keywords that need substring matching (site_tag, keyword)
-    keywords: Vec<(String, String)>,
+    /// Per-site keywords: site_tag -> list of keywords
+    keyword_index: HashMap<String, Vec<String>>,
     
-    /// Regex patterns that need regex matching (site_tag, pattern, compiled_regex)
-    regexes: Vec<(String, regex::Regex)>,
+    /// Per-site regexes: site_tag -> list of compiled regexes
+    regex_index: HashMap<String, Vec<regex::Regex>>,
 }
 
 impl GeoSite {
@@ -150,11 +150,17 @@ impl GeoSite {
                     .insert(site.to_string());
             }
             DomainEntry::Keyword(keyword) => {
-                self.keywords.push((site.to_string(), keyword.clone()));
+                self.keyword_index
+                    .entry(site.to_string())
+                    .or_default()
+                    .push(keyword.clone());
             }
             DomainEntry::Regex(pattern) => {
                 if let Ok(re) = regex::Regex::new(pattern) {
-                    self.regexes.push((site.to_string(), re));
+                    self.regex_index
+                        .entry(site.to_string())
+                        .or_default()
+                        .push(re);
                 }
             }
         }
@@ -164,8 +170,8 @@ impl GeoSite {
     fn rebuild_index(&mut self) {
         self.exact_index.clear();
         self.suffix_index.clear();
-        self.keywords.clear();
-        self.regexes.clear();
+        self.keyword_index.clear();
+        self.regex_index.clear();
 
         for (site, entries) in &self.sites {
             for entry in entries {
@@ -183,11 +189,17 @@ impl GeoSite {
                             .insert(site.clone());
                     }
                     DomainEntry::Keyword(keyword) => {
-                        self.keywords.push((site.clone(), keyword.clone()));
+                        self.keyword_index
+                            .entry(site.clone())
+                            .or_default()
+                            .push(keyword.clone());
                     }
                     DomainEntry::Regex(pattern) => {
                         if let Ok(re) = regex::Regex::new(pattern) {
-                            self.regexes.push((site.clone(), re));
+                            self.regex_index
+                                .entry(site.clone())
+                                .or_default()
+                                .push(re);
                         }
                     }
                 }
@@ -195,11 +207,11 @@ impl GeoSite {
         }
         
         debug!(
-            "GeoSite index built: {} exact, {} suffix, {} keywords, {} regexes",
+            "GeoSite index built: {} exact, {} suffix, {} keyword sites, {} regex sites",
             self.exact_index.len(),
             self.suffix_index.len(),
-            self.keywords.len(),
-            self.regexes.len()
+            self.keyword_index.len(),
+            self.regex_index.len()
         );
     }
 
@@ -351,7 +363,6 @@ impl GeoSite {
 
         // Check exact_index (Full entries)
         if full_as_suffix {
-            // Treat Full as suffix match
             for suffix in Self::domain_suffixes(&domain_lower) {
                 if let Some(sites) = self.exact_index.get(suffix) {
                     if sites.iter().any(|s| site_filter(s)) {
@@ -359,12 +370,9 @@ impl GeoSite {
                     }
                 }
             }
-        } else {
-            // Exact match only
-            if let Some(sites) = self.exact_index.get(&domain_lower) {
-                if sites.iter().any(|s| site_filter(s)) {
-                    return true;
-                }
+        } else if let Some(sites) = self.exact_index.get(&domain_lower) {
+            if sites.iter().any(|s| site_filter(s)) {
+                return true;
             }
         }
 
@@ -377,17 +385,25 @@ impl GeoSite {
             }
         }
 
-        // Check keywords
-        for (kw_site, keyword) in &self.keywords {
-            if site_filter(kw_site) && domain_lower.contains(keyword) {
-                return true;
+        // Check keywords — only for sites that pass the filter
+        for (site, keywords) in &self.keyword_index {
+            if site_filter(site) {
+                for keyword in keywords {
+                    if domain_lower.contains(keyword.as_str()) {
+                        return true;
+                    }
+                }
             }
         }
 
-        // Check regexes
-        for (re_site, re) in &self.regexes {
-            if site_filter(re_site) && re.is_match(&domain_lower) {
-                return true;
+        // Check regexes — only for sites that pass the filter
+        for (site, regexes) in &self.regex_index {
+            if site_filter(site) {
+                for re in regexes {
+                    if re.is_match(&domain_lower) {
+                        return true;
+                    }
+                }
             }
         }
 
@@ -680,8 +696,8 @@ mod tests {
         println!("\nIndex stats:");
         println!("  exact_index entries: {}", geosite.exact_index.len());
         println!("  suffix_index entries: {}", geosite.suffix_index.len());
-        println!("  keywords: {}", geosite.keywords.len());
-        println!("  regexes: {}", geosite.regexes.len());
+        println!("  keyword sites: {}", geosite.keyword_index.len());
+        println!("  regex sites: {}", geosite.regex_index.len());
     }
 
     #[test]

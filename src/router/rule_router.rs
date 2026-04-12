@@ -51,6 +51,8 @@ impl RuleType {
 pub struct Rule {
     /// Rule type
     pub rule_type: RuleType,
+    /// Optional label for Prometheus metrics
+    pub label: Option<String>,
     /// Match inbound tags
     pub inbound_tag: Vec<String>,
     /// Match protocols
@@ -154,9 +156,13 @@ impl RuleRouter {
     pub fn new(rules: Vec<Rule>, default_outbound: impl Into<String>) -> Self {
         let stats: Vec<RuleStat> = rules.iter().map(|_| RuleStat::default()).collect();
 
-        // Pre-compute Prometheus labels: "rule_1", "rule_2", ...
-        let rule_labels: Vec<String> = (0..rules.len())
-            .map(|i| format!("rule_{}", i + 1))
+        // Pre-compute Prometheus labels: use rule.label if set, otherwise "rule_N"
+        let rule_labels: Vec<String> = rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.label.clone().unwrap_or_else(|| format!("rule_{}", i + 1))
+            })
             .collect();
 
         // Pre-cache Prometheus metric handles to avoid HashMap lookups in hot path

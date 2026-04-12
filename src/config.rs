@@ -501,6 +501,10 @@ pub struct RoutingRule {
     #[serde(rename = "type", default = "default_rule_type")]
     pub rule_type: String,
 
+    /// Optional label for Prometheus metrics
+    #[serde(default)]
+    pub label: Option<String>,
+
     /// Domain patterns
     #[serde(default)]
     pub domain: Vec<String>,

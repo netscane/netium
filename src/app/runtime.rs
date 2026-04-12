@@ -114,6 +114,7 @@ pub struct RoutingConfig {
 #[derive(Debug, Clone, Default)]
 pub struct RouteRule {
     pub rule_type: String,
+    pub label: Option<String>,
     pub inbound_tag: Vec<String>,
     pub domain: Vec<String>,
     pub ip: Vec<String>,
@@ -258,6 +259,7 @@ impl From<&crate::config::RoutingRule> for RouteRule {
     fn from(r: &crate::config::RoutingRule) -> Self {
         RouteRule {
             rule_type: r.rule_type.clone(),
+            label: r.label.clone(),
             inbound_tag: r.inbound_tag.clone(),
             domain: r.domain.clone(),
             ip: r.ip.clone(),
@@ -358,6 +360,7 @@ impl Runtime {
             let rules = config.routing.rules.iter()
                 .map(|r| crate::router::rule_router::Rule {
                     rule_type: crate::router::rule_router::RuleType::from_str(&r.rule_type),
+                    label: r.label.clone(),
                     inbound_tag: r.inbound_tag.clone(),
                     domain: r.domain.clone(),
                     ip: r.ip.clone(),
