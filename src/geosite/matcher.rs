@@ -2,9 +2,10 @@
 
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use lru::LruCache;
+use parking_lot::Mutex;
 use tracing::debug;
 
 use crate::error::Result;
@@ -115,7 +116,7 @@ impl GeoSiteMatcher {
 
         // Check cache
         {
-            let mut cache = self.match_cache.lock().unwrap();
+            let mut cache = self.match_cache.lock();
             if let Some(&result) = cache.get(&key) {
                 return result;
             }
@@ -125,7 +126,7 @@ impl GeoSiteMatcher {
 
         // Store in cache
         {
-            let mut cache = self.match_cache.lock().unwrap();
+            let mut cache = self.match_cache.lock();
             cache.put(key, result);
         }
 
@@ -149,7 +150,7 @@ impl GeoSiteMatcher {
         
         // Check cache first
         {
-            let mut cache = self.china_cache.lock().unwrap();
+            let mut cache = self.china_cache.lock();
             if let Some(&is_china) = cache.get(&domain_lower) {
                 return is_china;
             }
@@ -160,29 +161,29 @@ impl GeoSiteMatcher {
         
         // Store in cache
         {
-            let mut cache = self.china_cache.lock().unwrap();
+            let mut cache = self.china_cache.lock();
             cache.put(domain_lower, is_china);
         }
         
         is_china
     }
 
-    /// Get cache statistics: (china_cache_len, match_cache_len, capacity)
+    /// Get cache statistics: (china_cache_len, capacity)
     pub fn cache_stats(&self) -> (usize, usize) {
-        let china = self.china_cache.lock().unwrap();
+        let china = self.china_cache.lock();
         (china.len(), china.cap().get())
     }
 
     /// Get match cache statistics
     pub fn match_cache_stats(&self) -> (usize, usize) {
-        let cache = self.match_cache.lock().unwrap();
+        let cache = self.match_cache.lock();
         (cache.len(), cache.cap().get())
     }
 
     /// Clear all caches
     pub fn clear_cache(&self) {
-        self.china_cache.lock().unwrap().clear();
-        self.match_cache.lock().unwrap().clear();
+        self.china_cache.lock().clear();
+        self.match_cache.lock().clear();
         debug!("GeoSite caches cleared");
     }
 

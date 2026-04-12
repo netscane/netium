@@ -21,7 +21,6 @@ use super::metrics::{
     INBOUND_BYTES_DOWNLOADED, INBOUND_BYTES_UPLOADED, INBOUND_CONNECTIONS_ACTIVE,
     INBOUND_CONNECTIONS_TOTAL, OUTBOUND_BYTES_DOWNLOADED, OUTBOUND_BYTES_UPLOADED,
     OUTBOUND_CONNECTIONS_ACTIVE, OUTBOUND_CONNECTIONS_TOTAL, REGISTRY,
-    TRAFFIC_BYTES_DOWNLOADED, TRAFFIC_BYTES_UPLOADED,
 };
 
 /// Global statistics collector
@@ -47,10 +46,10 @@ impl DispatcherStats {
         DISPATCHER_CONNECTIONS_ACTIVE.inc();
     }
 
-    pub fn connection_end(&self, uploaded: u64, downloaded: u64) {
+    pub fn connection_end(&self, _uploaded: u64, _downloaded: u64) {
         DISPATCHER_CONNECTIONS_ACTIVE.dec();
-        TRAFFIC_BYTES_UPLOADED.inc_by(uploaded);
-        TRAFFIC_BYTES_DOWNLOADED.inc_by(downloaded);
+        // Note: traffic bytes are already counted in relay_with_metrics() loop.
+        // Do NOT double-count here.
     }
 
     pub fn connection_failed(&self) {

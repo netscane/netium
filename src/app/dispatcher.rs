@@ -207,9 +207,10 @@ async fn relay_with_metrics(
     let (mut in_read, mut in_write) = tokio::io::split(inbound);
     let (mut out_read, mut out_write) = tokio::io::split(outbound);
 
-    let tag: Arc<str> = Arc::from(outbound_tag);
-    let tag_up = Arc::clone(&tag);
-    let tag_down = tag;
+    // Pre-fetch Prometheus counter handles outside the loop to avoid
+    // repeated HashMap lookups on every read/write iteration.
+    let up_counter = OUTBOUND_BYTES_UPLOADED.with_label_values(&[outbound_tag]);
+    let down_counter = OUTBOUND_BYTES_DOWNLOADED.with_label_values(&[outbound_tag]);
 
     // Upload: client → server
     let upload = async move {
@@ -232,9 +233,7 @@ async fn relay_with_metrics(
 
             total += n as u64;
             TRAFFIC_BYTES_UPLOADED.inc_by(n as u64);
-            OUTBOUND_BYTES_UPLOADED
-                .with_label_values(&[&tag_up])
-                .inc_by(n as u64);
+            up_counter.inc_by(n as u64);
         }
 
         let _ = out_write.shutdown().await;
@@ -262,9 +261,7 @@ async fn relay_with_metrics(
 
             total += n as u64;
             TRAFFIC_BYTES_DOWNLOADED.inc_by(n as u64);
-            OUTBOUND_BYTES_DOWNLOADED
-                .with_label_values(&[&tag_down])
-                .inc_by(n as u64);
+            down_counter.inc_by(n as u64);
         }
 
         let _ = in_write.shutdown().await;

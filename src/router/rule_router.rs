@@ -8,6 +8,8 @@ use std::time::Instant;
 
 use regex::Regex;
 
+use prometheus::{Histogram, Gauge, IntCounter};
+
 use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_DURATION, ROUTER_RULE_MATCH_MAX, ROUTER_DECISIONS_TOTAL};
 use crate::common::{Address, Metadata, Network};
 use crate::geoip::GeoIpMatcher;
@@ -123,6 +125,13 @@ enum CompiledDomainPattern {
     Plain(String),
 }
 
+/// Pre-cached Prometheus handles for a single rule
+struct RuleMetricHandles {
+    duration: Histogram,
+    max_gauge: Gauge,
+    hits: IntCounter,
+}
+
 /// Rule-based router
 pub struct RuleRouter {
     rules: Vec<Rule>,
@@ -131,8 +140,10 @@ pub struct RuleRouter {
     geoip: GeoIpMatcher,
     /// Pre-compiled domain patterns for each rule (same index as rules)
     compiled_domains: Vec<Vec<CompiledDomainPattern>>,
-    /// Pre-computed Prometheus label strings (same index as rules + "default")
-    rule_labels: Vec<String>,
+    /// Pre-cached Prometheus metric handles (same index as rules)
+    metric_handles: Vec<RuleMetricHandles>,
+    /// Pre-cached default hit counter
+    default_hit_counter: IntCounter,
     /// Statistics for each rule (same index as rules)
     stats: Arc<Vec<RuleStat>>,
     /// Hits for default outbound (no rule matched)
@@ -148,6 +159,17 @@ impl RuleRouter {
             .map(|i| format!("rule_{}", i + 1))
             .collect();
 
+        // Pre-cache Prometheus metric handles to avoid HashMap lookups in hot path
+        let metric_handles: Vec<RuleMetricHandles> = rule_labels
+            .iter()
+            .map(|label| RuleMetricHandles {
+                duration: ROUTER_RULE_MATCH_DURATION.with_label_values(&[label]),
+                max_gauge: ROUTER_RULE_MATCH_MAX.with_label_values(&[label]),
+                hits: ROUTER_RULE_HITS.with_label_values(&[label]),
+            })
+            .collect();
+        let default_hit_counter = ROUTER_RULE_HITS.with_label_values(&["default"]);
+
         // Pre-compile domain patterns for each rule
         let compiled_domains: Vec<Vec<CompiledDomainPattern>> = rules
             .iter()
@@ -160,7 +182,8 @@ impl RuleRouter {
             geosite: GeoSiteMatcher::new(),
             geoip: GeoIpMatcher::default(),
             compiled_domains,
-            rule_labels,
+            metric_handles,
+            default_hit_counter,
             stats: Arc::new(stats),
             default_hits: Arc::new(AtomicU64::new(0)),
         }
@@ -507,42 +530,31 @@ impl RuleRouter {
 impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
         ROUTER_DECISIONS_TOTAL.inc();
-        
+        let start = Instant::now();
+
         for (i, rule) in self.rules.iter().enumerate() {
-            let start = Instant::now();
             let matched = self.match_rule(i, rule, metadata);
-            let elapsed = start.elapsed();
-            let elapsed_ns = elapsed.as_nanos() as u64;
-            
-            // Record evaluation time (internal stats)
-            self.stats[i].match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
             self.stats[i].eval_count.fetch_add(1, Ordering::Relaxed);
-            
-            // Record to Prometheus using pre-computed label
-            let rule_label = &self.rule_labels[i];
-            let elapsed_secs = elapsed.as_secs_f64();
-            ROUTER_RULE_MATCH_DURATION
-                .with_label_values(&[rule_label])
-                .observe(elapsed_secs);
-            
-            // Update max if this is larger
-            let max_gauge = ROUTER_RULE_MATCH_MAX.with_label_values(&[rule_label]);
-            let current_max = max_gauge.get();
-            if elapsed_secs > current_max {
-                max_gauge.set(elapsed_secs);
-            }
-            
+
             if matched {
-                // Record hit
+                let elapsed = start.elapsed();
+                let elapsed_ns = elapsed.as_nanos() as u64;
+                self.stats[i].match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
                 self.stats[i].hits.fetch_add(1, Ordering::Relaxed);
-                ROUTER_RULE_HITS.with_label_values(&[rule_label]).inc();
+
+                let handles = &self.metric_handles[i];
+                let elapsed_secs = elapsed.as_secs_f64();
+                handles.duration.observe(elapsed_secs);
+                if elapsed_secs > handles.max_gauge.get() {
+                    handles.max_gauge.set(elapsed_secs);
+                }
+                handles.hits.inc();
                 return &rule.outbound_tag;
             }
         }
 
-        // Record default hit
         self.default_hits.fetch_add(1, Ordering::Relaxed);
-        ROUTER_RULE_HITS.with_label_values(&["default"]).inc();
+        self.default_hit_counter.inc();
         &self.default_outbound
     }
 
@@ -559,7 +571,8 @@ impl Default for RuleRouter {
             geosite: GeoSiteMatcher::new(),
             geoip: GeoIpMatcher::new(),
             compiled_domains: vec![],
-            rule_labels: vec![],
+            metric_handles: vec![],
+            default_hit_counter: ROUTER_RULE_HITS.with_label_values(&["default"]),
             stats: Arc::new(vec![]),
             default_hits: Arc::new(AtomicU64::new(0)),
         }

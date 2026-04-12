@@ -150,21 +150,42 @@ pub struct VmessStream {
     expected_response: Option<u8>,
 }
 
+/// Cached AEAD cipher to avoid re-initializing key schedule per chunk.
+enum CachedCipher {
+    Aes128Gcm(Aes128Gcm),
+    Chacha20Poly1305(ChaCha20Poly1305),
+    None,
+}
+
 /// Crypto context for read/write operations.
 struct CryptoContext {
     key: [u8; 16],
     iv: [u8; 16],
     nonce_count: u16,
     shake: Option<ShakeMask>,
+    cipher: CachedCipher,
 }
 
 impl CryptoContext {
-    fn new(key: [u8; 16], iv: [u8; 16], use_masking: bool) -> Self {
+    fn new(key: [u8; 16], iv: [u8; 16], use_masking: bool, security: Security) -> Self {
+        let cipher = match security {
+            Security::Aes128Gcm => {
+                CachedCipher::Aes128Gcm(Aes128Gcm::new_from_slice(&key).unwrap())
+            }
+            Security::Chacha20Poly1305 => {
+                let chacha_key = generate_chacha_key(&key);
+                CachedCipher::Chacha20Poly1305(
+                    ChaCha20Poly1305::new_from_slice(&chacha_key).unwrap(),
+                )
+            }
+            _ => CachedCipher::None,
+        };
         Self {
             key,
             iv,
             nonce_count: 0,
             shake: if use_masking { Some(ShakeMask::new(&iv)) } else { None },
+            cipher,
         }
     }
 
@@ -202,9 +223,9 @@ impl VmessStream {
             inner,
             security,
             use_padding,
-            write_ctx: CryptoContext::new(request_key, request_iv, true),
+            write_ctx: CryptoContext::new(request_key, request_iv, true, security),
             pending_header: Some(pending_header),
-            read_ctx: CryptoContext::new(response_key, response_iv, true),
+            read_ctx: CryptoContext::new(response_key, response_iv, true, security),
             read_buf: Vec::new(),
             read_pos: 0,
             response_state: ResponseHeaderState::ReadingLength(BufReader::new()),
@@ -229,9 +250,9 @@ impl VmessStream {
             inner,
             security,
             use_padding,
-            write_ctx: CryptoContext::new(response_key, response_iv, use_masking),
+            write_ctx: CryptoContext::new(response_key, response_iv, use_masking, security),
             pending_header: None,
-            read_ctx: CryptoContext::new(request_key, request_iv, use_masking),
+            read_ctx: CryptoContext::new(request_key, request_iv, use_masking, security),
             read_buf: Vec::new(),
             read_pos: 0,
             response_state: ResponseHeaderState::Done,
@@ -260,14 +281,14 @@ impl VmessStream {
         chunk.extend_from_slice(&masked_len.to_be_bytes());
 
         match self.security {
-            Security::Aes128Gcm => {
-                let key = self.write_ctx.key;
-                let ct = self.aead_encrypt::<Aes128Gcm>(&key, data)?;
-                chunk.extend_from_slice(&ct);
-            }
-            Security::Chacha20Poly1305 => {
-                let key = generate_chacha_key(&self.write_ctx.key);
-                let ct = self.aead_encrypt::<ChaCha20Poly1305>(&key, data)?;
+            Security::Aes128Gcm | Security::Chacha20Poly1305 => {
+                let nonce = self.write_ctx.next_nonce();
+                let ct = match &self.write_ctx.cipher {
+                    CachedCipher::Aes128Gcm(c) => c.encrypt(Nonce::from_slice(&nonce), data),
+                    CachedCipher::Chacha20Poly1305(c) => c.encrypt(Nonce::from_slice(&nonce), data),
+                    CachedCipher::None => unreachable!(),
+                }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                 chunk.extend_from_slice(&ct);
             }
             _ => chunk.extend_from_slice(data),
@@ -275,14 +296,6 @@ impl VmessStream {
 
         chunk.resize(chunk.len() + padding as usize, 0);
         Ok(chunk)
-    }
-
-    fn aead_encrypt<C: KeyInit + Aead>(&mut self, key: &[u8], data: &[u8]) -> io::Result<Vec<u8>> {
-        let nonce = self.write_ctx.next_nonce();
-        C::new_from_slice(key)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
-            .encrypt(Nonce::from_slice(&nonce), data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 }
 
@@ -294,30 +307,20 @@ impl VmessStream {
     fn decrypt_chunk(&mut self, data: &[u8], padding: u16) -> io::Result<Vec<u8>> {
         let ct_len = data.len().saturating_sub(padding as usize);
         match self.security {
-            Security::Aes128Gcm => {
+            Security::Aes128Gcm | Security::Chacha20Poly1305 => {
                 if ct_len < TAG_SIZE {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "ciphertext too short"));
                 }
-                let key = self.read_ctx.key;
-                self.aead_decrypt::<Aes128Gcm>(&key, &data[..ct_len])
-            }
-            Security::Chacha20Poly1305 => {
-                if ct_len < TAG_SIZE {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ciphertext too short"));
+                let nonce = self.read_ctx.next_nonce();
+                match &self.read_ctx.cipher {
+                    CachedCipher::Aes128Gcm(c) => c.decrypt(Nonce::from_slice(&nonce), &data[..ct_len]),
+                    CachedCipher::Chacha20Poly1305(c) => c.decrypt(Nonce::from_slice(&nonce), &data[..ct_len]),
+                    CachedCipher::None => unreachable!(),
                 }
-                let key = generate_chacha_key(&self.read_ctx.key);
-                self.aead_decrypt::<ChaCha20Poly1305>(&key, &data[..ct_len])
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
             }
             _ => Ok(data[..ct_len].to_vec()),
         }
-    }
-
-    fn aead_decrypt<C: KeyInit + Aead>(&mut self, key: &[u8], data: &[u8]) -> io::Result<Vec<u8>> {
-        let nonce = self.read_ctx.next_nonce();
-        C::new_from_slice(key)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
-            .decrypt(Nonce::from_slice(&nonce), data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
     fn decode_length(&mut self, buf: &[u8; 2]) -> (u16, u16) {

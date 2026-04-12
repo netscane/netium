@@ -149,9 +149,14 @@ impl GeoIpMatcher {
     ///
     /// Country code should be ISO 3166-1 alpha-2 (e.g., "CN", "US", "JP")
     pub fn matches(&self, country_code: &str, ip: IpAddr) -> bool {
-        let country_code_upper = country_code.to_uppercase();
+        // Try direct lookup first (fast path for already-uppercase codes)
+        let cidrs = self.countries.get(country_code).or_else(|| {
+            // Fallback: uppercase and retry (only allocates if not already uppercase)
+            let upper = country_code.to_uppercase();
+            self.countries.get(&upper)
+        });
 
-        if let Some(cidrs) = self.countries.get(&country_code_upper) {
+        if let Some(cidrs) = cidrs {
             for cidr in cidrs {
                 if cidr.contains(ip) {
                     return true;
