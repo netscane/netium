@@ -24,7 +24,7 @@ use crate::protocol::{
     DirectProtocol, HttpProtocol, ProxyProtocol,
     Socks5Protocol, VmessProtocol, VmessProtocolConfig, VmessSecurity,
 };
-use crate::router::{Router, RuleRouter, StaticRouter};
+use crate::router::{Router, RuleRouterBuilder, StaticRouter};
 use crate::transport::{
     BlackholeTransport, ChainedLayer, RejectTransport, StreamLayer,
     TcpTransport, TlsConfig, TlsWrapper, Transport, WebSocketConfig, WebSocketWrapper, MuxManager,
@@ -370,9 +370,10 @@ impl Runtime {
                 })
                 .collect();
             Arc::new(
-                RuleRouter::new(rules, &config.routing.default_outbound)
-                    .with_geosite(crate::geosite::GeoSiteMatcher::load_default())
-                    .with_geoip(crate::geoip::GeoIpMatcher::load_default())
+                RuleRouterBuilder::new(rules, &config.routing.default_outbound)
+                    .with_geosite(crate::geosite::GeoSite::load_default())
+                    .with_geoip(crate::geoip::GeoIpDb::load_default())
+                    .build()
             )
         };
 

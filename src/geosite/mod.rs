@@ -3,10 +3,6 @@
 //! Uses geosite-rs crate to parse V2Ray geosite.dat files.
 //! Implements inverted index for fast domain lookup.
 
-mod matcher;
-
-pub use matcher::GeoSiteMatcher;
-
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -124,8 +120,8 @@ pub struct GeoSite {
     /// Per-site keywords: site_tag -> list of keywords
     keyword_index: HashMap<String, Vec<String>>,
     
-    /// Per-site regexes: site_tag -> list of compiled regexes
-    regex_index: HashMap<String, Vec<regex::Regex>>,
+    /// Per-site regexes: site_tag -> compiled RegexSet for batch matching
+    regex_index: HashMap<String, regex::RegexSet>,
 }
 
 impl GeoSite {
@@ -134,36 +130,16 @@ impl GeoSite {
         Self::default()
     }
 
-    /// Add a single entry to the inverted index
-    fn index_entry(&mut self, site: &str, entry: &DomainEntry) {
-        match entry {
-            DomainEntry::Full(domain) => {
-                self.exact_index
-                    .entry(domain.clone())
-                    .or_default()
-                    .insert(site.to_string());
-            }
-            DomainEntry::Domain(domain) => {
-                self.suffix_index
-                    .entry(domain.clone())
-                    .or_default()
-                    .insert(site.to_string());
-            }
-            DomainEntry::Keyword(keyword) => {
-                self.keyword_index
-                    .entry(site.to_string())
-                    .or_default()
-                    .push(keyword.clone());
-            }
-            DomainEntry::Regex(pattern) => {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    self.regex_index
-                        .entry(site.to_string())
-                        .or_default()
-                        .push(re);
-                }
-            }
+    /// Build RegexSet from patterns, skipping invalid ones
+    fn build_regex_set(patterns: &[String]) -> Option<regex::RegexSet> {
+        let valid: Vec<&str> = patterns.iter()
+            .filter(|p| regex::Regex::new(p).is_ok())
+            .map(|p| p.as_str())
+            .collect();
+        if valid.is_empty() {
+            return None;
         }
+        regex::RegexSet::new(&valid).ok()
     }
 
     /// Rebuild inverted index from sites
@@ -172,6 +148,9 @@ impl GeoSite {
         self.suffix_index.clear();
         self.keyword_index.clear();
         self.regex_index.clear();
+
+        // Collect regex patterns per site first, then batch-compile
+        let mut regex_patterns: HashMap<String, Vec<String>> = HashMap::new();
 
         for (site, entries) in &self.sites {
             for entry in entries {
@@ -195,14 +174,19 @@ impl GeoSite {
                             .push(keyword.clone());
                     }
                     DomainEntry::Regex(pattern) => {
-                        if let Ok(re) = regex::Regex::new(pattern) {
-                            self.regex_index
-                                .entry(site.clone())
-                                .or_default()
-                                .push(re);
-                        }
+                        regex_patterns
+                            .entry(site.clone())
+                            .or_default()
+                            .push(pattern.clone());
                     }
                 }
+            }
+        }
+
+        // Build RegexSet per site
+        for (site, patterns) in &regex_patterns {
+            if let Some(set) = Self::build_regex_set(patterns) {
+                self.regex_index.insert(site.clone(), set);
             }
         }
         
@@ -243,7 +227,19 @@ impl GeoSite {
         Ok(geosite)
     }
 
-    /// Try to load from common locations
+    /// Merge builtin sites into this GeoSite (skips existing sites).
+    pub fn merge_builtin(&mut self) {
+        let builtin = Self::with_builtin();
+        for site in builtin.sites() {
+            if self.get(site).is_none() {
+                if let Some(entries) = builtin.get(site) {
+                    self.add_site(site, entries.clone());
+                }
+            }
+        }
+    }
+
+    /// Try to load from common locations, merging builtin sites.
     pub fn load_default() -> Self {
         let paths = [
             "geosite.dat",
@@ -257,10 +253,11 @@ impl GeoSite {
             if path.exists() {
                 debug!("Found geosite.dat at {:?}", path);
                 match Self::load_from_dat(path) {
-                    Ok(geosite) if !geosite.sites.is_empty() => {
+                    Ok(mut geosite) if !geosite.sites.is_empty() => {
                         let cn_count = geosite.get("cn").map(|v| v.len()).unwrap_or(0);
                         debug!("Loaded GeoSite from {:?}: {} sites, cn has {} domains", 
                             path, geosite.sites.len(), cn_count);
+                        geosite.merge_builtin();
                         return geosite;
                     }
                     Err(e) => {
@@ -338,18 +335,18 @@ impl GeoSite {
         self.sites.get(&site.to_lowercase())
     }
 
-    /// Extract domain suffixes for lookup
-    /// e.g., "www.api.bilibili.com" -> ["www.api.bilibili.com", "api.bilibili.com", "bilibili.com", "com"]
-    fn domain_suffixes(domain: &str) -> Vec<&str> {
-        let mut suffixes = vec![domain];
+    /// Iterate domain suffixes without allocation.
+    /// e.g., "www.api.bilibili.com" yields:
+    ///   "www.api.bilibili.com", "api.bilibili.com", "bilibili.com", "com"
+    fn for_each_suffix(domain: &str, mut f: impl FnMut(&str) -> bool) {
+        if f(domain) { return; }
         let mut remaining = domain;
         while let Some(pos) = remaining.find('.') {
             remaining = &remaining[pos + 1..];
-            if !remaining.is_empty() {
-                suffixes.push(remaining);
+            if !remaining.is_empty() && f(remaining) {
+                return;
             }
         }
-        suffixes
     }
 
     /// Core matching function
@@ -363,13 +360,17 @@ impl GeoSite {
 
         // Check exact_index (Full entries)
         if full_as_suffix {
-            for suffix in Self::domain_suffixes(&domain_lower) {
+            let mut found = false;
+            Self::for_each_suffix(&domain_lower, |suffix| {
                 if let Some(sites) = self.exact_index.get(suffix) {
                     if sites.iter().any(|s| site_filter(s)) {
-                        return true;
+                        found = true;
+                        return true; // early exit
                     }
                 }
-            }
+                false
+            });
+            if found { return true; }
         } else if let Some(sites) = self.exact_index.get(&domain_lower) {
             if sites.iter().any(|s| site_filter(s)) {
                 return true;
@@ -377,12 +378,18 @@ impl GeoSite {
         }
 
         // Check suffix_index (Domain entries) - always suffix match
-        for suffix in Self::domain_suffixes(&domain_lower) {
-            if let Some(sites) = self.suffix_index.get(suffix) {
-                if sites.iter().any(|s| site_filter(s)) {
-                    return true;
+        {
+            let mut found = false;
+            Self::for_each_suffix(&domain_lower, |suffix| {
+                if let Some(sites) = self.suffix_index.get(suffix) {
+                    if sites.iter().any(|s| site_filter(s)) {
+                        found = true;
+                        return true;
+                    }
                 }
-            }
+                false
+            });
+            if found { return true; }
         }
 
         // Check keywords — only for sites that pass the filter
@@ -397,13 +404,9 @@ impl GeoSite {
         }
 
         // Check regexes — only for sites that pass the filter
-        for (site, regexes) in &self.regex_index {
-            if site_filter(site) {
-                for re in regexes {
-                    if re.is_match(&domain_lower) {
-                        return true;
-                    }
-                }
+        for (site, regex_set) in &self.regex_index {
+            if site_filter(site) && regex_set.is_match(&domain_lower) {
+                return true;
             }
         }
 
@@ -436,10 +439,29 @@ impl GeoSite {
     /// Add entries for a site programmatically (also updates index)
     pub fn add_site(&mut self, name: &str, entries: Vec<DomainEntry>) {
         let name_lower = name.to_lowercase();
-        // Update index for each entry
+        let mut regex_patterns = Vec::new();
+
         for entry in &entries {
-            self.index_entry(&name_lower, entry);
+            match entry {
+                DomainEntry::Full(domain) => {
+                    self.exact_index.entry(domain.clone()).or_default().insert(name_lower.clone());
+                }
+                DomainEntry::Domain(domain) => {
+                    self.suffix_index.entry(domain.clone()).or_default().insert(name_lower.clone());
+                }
+                DomainEntry::Keyword(keyword) => {
+                    self.keyword_index.entry(name_lower.clone()).or_default().push(keyword.clone());
+                }
+                DomainEntry::Regex(pattern) => {
+                    regex_patterns.push(pattern.clone());
+                }
+            }
         }
+
+        if let Some(set) = Self::build_regex_set(&regex_patterns) {
+            self.regex_index.insert(name_lower.clone(), set);
+        }
+
         self.sites.insert(name_lower, entries);
     }
 
@@ -698,11 +720,45 @@ mod tests {
         println!("  suffix_index entries: {}", geosite.suffix_index.len());
         println!("  keyword sites: {}", geosite.keyword_index.len());
         println!("  regex sites: {}", geosite.regex_index.len());
+
+        // Print keyword/regex counts per category for perf analysis
+        println!("\nTop keyword categories:");
+        let mut kw_counts: Vec<_> = geosite.keyword_index.iter()
+            .map(|(site, kws)| (site.as_str(), kws.len()))
+            .collect();
+        kw_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        for (site, count) in kw_counts.iter().take(10) {
+            println!("  {}: {} keywords", site, count);
+        }
+
+        println!("\nTop regex categories:");
+        let mut re_counts: Vec<_> = geosite.regex_index.iter()
+            .map(|(site, res)| (site.as_str(), res.len()))
+            .collect();
+        re_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        for (site, count) in re_counts.iter().take(10) {
+            println!("  {}: {} regexes", site, count);
+        }
+
+        let total_keywords: usize = geosite.keyword_index.values().map(|v| v.len()).sum();
+        let total_regexes: usize = geosite.regex_index.values().map(|v| v.len()).sum();
+        println!("\nTotal: {} keywords, {} regexes", total_keywords, total_regexes);
+
+        // Show cn/geolocation-cn keyword counts (chinasites path)
+        let cn_kw = geosite.keyword_index.get("cn").map(|v| v.len()).unwrap_or(0);
+        let geocn_kw = geosite.keyword_index.get("geolocation-cn").map(|v| v.len()).unwrap_or(0);
+        let ads_kw = geosite.keyword_index.get("category-ads-all").map(|v| v.len()).unwrap_or(0);
+        println!("\nChinaSites keywords: cn={}, geolocation-cn={}", cn_kw, geocn_kw);
+        println!("Ads keywords: category-ads-all={}", ads_kw);
     }
 
     #[test]
     fn test_domain_suffixes() {
-        let suffixes = GeoSite::domain_suffixes("www.api.bilibili.com");
+        let mut suffixes = Vec::new();
+        GeoSite::for_each_suffix("www.api.bilibili.com", |s| {
+            suffixes.push(s.to_string());
+            false
+        });
         assert_eq!(suffixes, vec![
             "www.api.bilibili.com",
             "api.bilibili.com", 
@@ -710,10 +766,18 @@ mod tests {
             "com"
         ]);
 
-        let suffixes = GeoSite::domain_suffixes("example.com");
+        let mut suffixes = Vec::new();
+        GeoSite::for_each_suffix("example.com", |s| {
+            suffixes.push(s.to_string());
+            false
+        });
         assert_eq!(suffixes, vec!["example.com", "com"]);
 
-        let suffixes = GeoSite::domain_suffixes("localhost");
+        let mut suffixes = Vec::new();
+        GeoSite::for_each_suffix("localhost", |s| {
+            suffixes.push(s.to_string());
+            false
+        });
         assert_eq!(suffixes, vec!["localhost"]);
     }
 }

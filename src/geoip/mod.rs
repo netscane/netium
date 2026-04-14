@@ -8,7 +8,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
-use geosite_rs::{decode_geoip, Cidr};
+use geosite_rs::decode_geoip;
 use tracing::{debug, warn};
 
 /// Sorted IPv4 CIDR list for binary search
@@ -100,13 +100,15 @@ struct CountryCidrs {
     v6: Ipv6CidrSet,
 }
 
-/// GeoIP matcher using V2Ray geoip.dat format
+/// GeoIP database using V2Ray geoip.dat format.
+///
+/// Pure data provider — no matching policy, just IP-to-country lookup.
 #[derive(Clone, Default)]
-pub struct GeoIpMatcher {
+pub struct GeoIpDb {
     countries: HashMap<String, CountryCidrs>,
 }
 
-impl GeoIpMatcher {
+impl GeoIpDb {
     pub fn new() -> Self {
         Self {
             countries: HashMap::new(),
@@ -124,7 +126,7 @@ impl GeoIpMatcher {
         let geoip_list =
             decode_geoip(&data).map_err(|e| format!("Failed to parse geoip.dat: {}", e))?;
 
-        let mut matcher = Self::new();
+        let mut db = Self::new();
 
         for entry in &geoip_list.entry {
             let country_code = entry.country_code.to_uppercase();
@@ -151,14 +153,14 @@ impl GeoIpMatcher {
             let total = v4_cidrs.len() + v6_cidrs.len();
             debug!("Loaded geoip:{} with {} CIDRs", country_code, total);
 
-            matcher.countries.insert(country_code, CountryCidrs {
+            db.countries.insert(country_code, CountryCidrs {
                 v4: Ipv4CidrSet::from_cidrs(v4_cidrs.into_iter()),
                 v6: Ipv6CidrSet::from_cidrs(v6_cidrs.into_iter()),
             });
         }
 
-        debug!("Loaded {} countries from {:?}", matcher.countries.len(), path);
-        Ok(matcher)
+        debug!("Loaded {} countries from {:?}", db.countries.len(), path);
+        Ok(db)
     }
 
     /// Try to load GeoIP database from common locations
@@ -173,9 +175,9 @@ impl GeoIpMatcher {
         for path in paths {
             if Path::new(path).exists() {
                 match Self::load(path) {
-                    Ok(matcher) => {
+                    Ok(db) => {
                         debug!("Loaded GeoIP database from {}", path);
-                        return matcher;
+                        return db;
                     }
                     Err(e) => {
                         warn!("Failed to load GeoIP database from {}: {}", path, e);
@@ -188,10 +190,10 @@ impl GeoIpMatcher {
         Self::new()
     }
 
-    /// Check if an IP address belongs to a country
+    /// Check if an IP address belongs to a country.
     ///
-    /// Country code should be ISO 3166-1 alpha-2 (e.g., "CN", "US", "JP")
-    pub fn matches(&self, country_code: &str, ip: IpAddr) -> bool {
+    /// Country code: ISO 3166-1 alpha-2 (e.g., "CN", "US", "JP")
+    pub fn contains(&self, country_code: &str, ip: IpAddr) -> bool {
         let country = self.countries.get(country_code).or_else(|| {
             let upper = country_code.to_uppercase();
             self.countries.get(&upper)
@@ -236,9 +238,9 @@ mod tests {
 
     #[test]
     fn test_geoip_no_database() {
-        let matcher = GeoIpMatcher::new();
-        assert!(!matcher.is_loaded());
-        assert!(!matcher.matches("CN", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        let db = GeoIpDb::new();
+        assert!(!db.is_loaded());
+        assert!(!db.contains("CN", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
     #[test]
@@ -269,11 +271,11 @@ mod tests {
     /*
     #[test]
     fn test_load_sped_database() {
-        let matcher = GeoIpMatcher::load("/home/netium/geoip.dat").unwrap();
-        assert!(matcher.is_loaded());
-        assert!(!matcher.matches("CN", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-        assert!(matcher.matches("CN", IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5))));
-        assert!(matcher.matches("US", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        let db = GeoIpDb::load("/home/netium/geoip.dat").unwrap();
+        assert!(db.is_loaded());
+        assert!(!db.contains("CN", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(db.contains("CN", IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5))));
+        assert!(db.contains("US", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
     */
 }

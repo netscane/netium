@@ -7,9 +7,13 @@
 //!
 //! Router is a pure function: Metadata -> outbound_tag
 
+pub mod domain_trie;
+pub mod matchers;
 pub mod rule_router;
+pub mod stats;
 
-pub use rule_router::{Rule, RuleRouter, RuleStatsSnapshot, RuleType};
+pub use rule_router::{Rule, RuleRouterBuilder, RuleType};
+pub use stats::RuleStatsSnapshot;
 
 use std::any::Any;
 
@@ -20,12 +24,7 @@ use crate::common::Metadata;
 /// IMPORTANT: Router must NOT perform any IO or async operations.
 /// It only reads Metadata and returns an outbound tag.
 pub trait Router: Send + Sync {
-    /// Select an outbound based on metadata
-    ///
-    /// This is a pure function - no IO, no side effects.
     fn select(&self, metadata: &Metadata) -> &str;
-
-    /// For downcasting to concrete types (e.g., to access stats)
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -36,9 +35,7 @@ pub struct StaticRouter {
 
 impl StaticRouter {
     pub fn new(outbound: impl Into<String>) -> Self {
-        Self {
-            outbound: outbound.into(),
-        }
+        Self { outbound: outbound.into() }
     }
 }
 

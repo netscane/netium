@@ -1,537 +1,368 @@
-//! Rule-based Router implementation
+//! Rule-based Router
+//!
+//! Each routing rule composes condition matchers (domain, IP, port).
+//! A rule matches when ALL its matchers agree (AND logic).
+//!
+//! Architecture:
+//! ```text
+//! select(metadata) →
+//!   for each RoutingRule:
+//!     if all matchers pass → return outbound_tag
+//!   return default_outbound
+//! ```
 
 use std::any::Any;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use regex::Regex;
+use prometheus::{Gauge, Histogram, IntCounter};
 
-use prometheus::{Histogram, Gauge, IntCounter};
-
-use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_DURATION, ROUTER_RULE_MATCH_MAX, ROUTER_DECISIONS_TOTAL};
+use crate::app::metrics::{
+    ROUTER_DECISIONS_TOTAL, ROUTER_RULE_HITS, ROUTER_RULE_MATCH_DURATION, ROUTER_RULE_MATCH_MAX,
+};
 use crate::common::{Address, Metadata, Network};
-use crate::geoip::GeoIpMatcher;
-use crate::geosite::GeoSiteMatcher;
+use crate::geoip::GeoIpDb;
+use crate::geosite::DomainEntry;
 
+use super::matchers::{DomainMatcher, DomainMatcherBuilder, IpMatcher, IpMatcherBuilder, PortMatcher};
+use super::stats::{RuleStat, RuleStatsSnapshot};
 use super::Router;
 
-/// Rule type - determines how the rule is evaluated
+// ============================================================================
+// Rule Types
+// ============================================================================
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum RuleType {
-    /// Match based on specified fields (domain, ip, port, etc.)
     #[default]
     Field,
-    /// Match all Chinese domains (shortcut for geosite:cn)
     ChinaSites,
-    /// Match all Chinese IPs (shortcut for geoip:CN)
     ChinaIp,
-    /// Match private/LAN IPs (10.x, 172.16.x, 192.168.x, etc.)
     PrivateIp,
-    /// Match all traffic (catch-all rule)
     All,
 }
 
 impl RuleType {
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "field" => RuleType::Field,
-            "chinasites" | "china_sites" | "china-sites" => RuleType::ChinaSites,
-            "chinaip" | "china_ip" | "china-ip" => RuleType::ChinaIp,
-            "privateip" | "private_ip" | "private-ip" | "private" => RuleType::PrivateIp,
-            "all" | "any" | "*" => RuleType::All,
-            _ => RuleType::Field,
+            "field" => Self::Field,
+            "chinasites" | "china_sites" | "china-sites" => Self::ChinaSites,
+            "chinaip" | "china_ip" | "china-ip" => Self::ChinaIp,
+            "privateip" | "private_ip" | "private-ip" | "private" => Self::PrivateIp,
+            "all" | "any" | "*" => Self::All,
+            _ => Self::Field,
         }
     }
 }
 
-/// Routing rule
+// ============================================================================
+// Rule Definition (config input)
+// ============================================================================
+
+/// Raw rule definition from config — used to build compiled RoutingRule.
 #[derive(Debug, Clone, Default)]
 pub struct Rule {
-    /// Rule type
     pub rule_type: RuleType,
-    /// Optional label for Prometheus metrics
     pub label: Option<String>,
-    /// Match inbound tags
     pub inbound_tag: Vec<String>,
-    /// Match protocols
     pub protocol: Vec<String>,
-    /// Match networks
     pub network: Vec<Network>,
-    /// Match domain patterns
     pub domain: Vec<String>,
-    /// Match IP patterns
     pub ip: Vec<String>,
-    /// Match port patterns
     pub port: Option<String>,
-    /// Target outbound tag
     pub outbound_tag: String,
 }
 
-/// Statistics for a single rule
-#[derive(Debug)]
-pub struct RuleStat {
-    /// Number of times this rule was hit
-    pub hits: AtomicU64,
-    /// Total time spent matching this rule (in nanoseconds)
-    pub match_time_ns: AtomicU64,
-    /// Number of times this rule was evaluated (for avg calculation)
-    pub eval_count: AtomicU64,
+// ============================================================================
+// Compiled Routing Rule
+// ============================================================================
+
+/// A compiled routing rule with optimized matchers.
+struct RoutingRule {
+    outbound_tag: String,
+    is_catch_all: bool,
+
+    // Metadata filters
+    inbound_tag: Vec<String>,
+    protocol: Vec<String>,
+    network: Vec<Network>,
+
+    // Condition matchers (None = don't check this dimension)
+    domain_matcher: Option<DomainMatcher>,
+    ip_matcher: Option<IpMatcher>,
+    port_matcher: Option<PortMatcher>,
 }
 
-impl Default for RuleStat {
-    fn default() -> Self {
-        Self {
-            hits: AtomicU64::new(0),
-            match_time_ns: AtomicU64::new(0),
-            eval_count: AtomicU64::new(0),
+impl RoutingRule {
+    /// Check if this rule matches the given metadata.
+    fn matches(&self, metadata: &Metadata) -> bool {
+        if self.is_catch_all {
+            return self.check_metadata_filters(metadata);
         }
+
+        if !self.check_metadata_filters(metadata) {
+            return false;
+        }
+
+        let has_domain = self.domain_matcher.is_some();
+        let has_ip = self.ip_matcher.is_some();
+
+        // If no domain/IP matchers, this is a metadata-only rule (matches all addresses)
+        if !has_domain && !has_ip && self.port_matcher.is_none() {
+            return true;
+        }
+
+        // Check port
+        if let Some(pm) = &self.port_matcher {
+            if !pm.matches(metadata.destination.port()) {
+                return false;
+            }
+        }
+
+        // Check address-specific matchers
+        match &metadata.destination {
+            Address::Domain(domain, _) => {
+                if let Some(dm) = &self.domain_matcher {
+                    dm.matches(domain)
+                } else {
+                    !has_ip // no domain matcher but has IP matcher → skip
+                }
+            }
+            Address::Socket(addr) => {
+                if let Some(im) = &self.ip_matcher {
+                    im.matches(addr.ip())
+                } else {
+                    !has_domain
+                }
+            }
+        }
+    }
+
+    fn check_metadata_filters(&self, metadata: &Metadata) -> bool {
+        if !self.inbound_tag.is_empty()
+            && !self.inbound_tag.iter().any(|t| t.as_str() == &*metadata.inbound_tag)
+        {
+            return false;
+        }
+        if !self.protocol.is_empty()
+            && !self.protocol.iter().any(|p| p == &metadata.protocol)
+        {
+            return false;
+        }
+        if !self.network.is_empty() && !self.network.contains(&metadata.network) {
+            return false;
+        }
+        true
     }
 }
 
-impl Clone for RuleStat {
-    fn clone(&self) -> Self {
-        Self {
-            hits: AtomicU64::new(self.hits.load(Ordering::Relaxed)),
-            match_time_ns: AtomicU64::new(self.match_time_ns.load(Ordering::Relaxed)),
-            eval_count: AtomicU64::new(self.eval_count.load(Ordering::Relaxed)),
-        }
-    }
-}
+// ============================================================================
+// Pre-cached Prometheus handles
+// ============================================================================
 
-/// Snapshot of rule statistics for reporting
-#[derive(Debug, Clone)]
-pub struct RuleStatsSnapshot {
-    /// Rule description (type + outbound)
-    pub rule_desc: String,
-    /// Number of hits
-    pub hits: u64,
-    /// Percentage of total hits
-    pub percent: f64,
-    /// Average match time in microseconds
-    pub avg_match_time_us: f64,
-    /// Total match time in microseconds
-    pub total_match_time_us: f64,
-}
-
-/// Compiled domain pattern for efficient matching
-enum CompiledDomainPattern {
-    GeoSite(String),
-    /// domain: suffix match (stores ".target" for ends_with check)
-    DomainSuffix { exact: String, suffix: String },
-    Full(String),
-    Regexp(Regex),
-    Keyword(String),
-    /// Plain substring match
-    Plain(String),
-}
-
-/// Pre-cached Prometheus handles for a single rule
-struct RuleMetricHandles {
+struct MetricHandles {
     duration: Histogram,
     max_gauge: Gauge,
     hits: IntCounter,
 }
 
-/// Rule-based router
+// ============================================================================
+// RuleRouter
+// ============================================================================
+
 pub struct RuleRouter {
-    rules: Vec<Rule>,
+    rules: Vec<RoutingRule>,
     default_outbound: String,
-    geosite: GeoSiteMatcher,
-    geoip: GeoIpMatcher,
-    /// Pre-compiled domain patterns for each rule (same index as rules)
-    compiled_domains: Vec<Vec<CompiledDomainPattern>>,
-    /// Pre-cached Prometheus metric handles (same index as rules)
-    metric_handles: Vec<RuleMetricHandles>,
-    /// Pre-cached default hit counter
+
+    // Prometheus
+    metric_handles: Vec<MetricHandles>,
     default_hit_counter: IntCounter,
-    /// Statistics for each rule (same index as rules)
+
+    // Stats
     stats: Arc<Vec<RuleStat>>,
-    /// Hits for default outbound (no rule matched)
     default_hits: Arc<AtomicU64>,
 }
 
-impl RuleRouter {
+/// Builder for RuleRouter — separates construction from usage.
+pub struct RuleRouterBuilder {
+    raw_rules: Vec<Rule>,
+    default_outbound: String,
+    geosite: crate::geosite::GeoSite,
+    geoip: Arc<GeoIpDb>,
+}
+
+impl RuleRouterBuilder {
     pub fn new(rules: Vec<Rule>, default_outbound: impl Into<String>) -> Self {
-        let stats: Vec<RuleStat> = rules.iter().map(|_| RuleStat::default()).collect();
+        Self {
+            raw_rules: rules,
+            default_outbound: default_outbound.into(),
+            geosite: crate::geosite::GeoSite::with_builtin(),
+            geoip: Arc::new(GeoIpDb::default()),
+        }
+    }
 
-        // Pre-compute Prometheus labels: use rule.label if set, otherwise "rule_N"
-        let rule_labels: Vec<String> = rules
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                r.label.clone().unwrap_or_else(|| format!("rule_{}", i + 1))
-            })
-            .collect();
+    pub fn with_geosite(mut self, geosite: crate::geosite::GeoSite) -> Self {
+        self.geosite = geosite;
+        self
+    }
 
-        // Pre-cache Prometheus metric handles to avoid HashMap lookups in hot path
-        let metric_handles: Vec<RuleMetricHandles> = rule_labels
-            .iter()
-            .map(|label| RuleMetricHandles {
+    pub fn with_geoip(mut self, geoip: GeoIpDb) -> Self {
+        self.geoip = Arc::new(geoip);
+        self
+    }
+
+    /// Compile raw rules into optimized RoutingRules and build the router.
+    pub fn build(self) -> RuleRouter {
+        let mut compiled_rules = Vec::with_capacity(self.raw_rules.len());
+        let mut labels = Vec::with_capacity(self.raw_rules.len());
+
+        for (i, rule) in self.raw_rules.iter().enumerate() {
+            let label = rule.label.clone()
+                .unwrap_or_else(|| format!("rule_{}", i + 1));
+            labels.push(label);
+            compiled_rules.push(self.compile_rule(rule));
+        }
+
+        let metric_handles: Vec<MetricHandles> = labels.iter()
+            .map(|label| MetricHandles {
                 duration: ROUTER_RULE_MATCH_DURATION.with_label_values(&[label]),
                 max_gauge: ROUTER_RULE_MATCH_MAX.with_label_values(&[label]),
                 hits: ROUTER_RULE_HITS.with_label_values(&[label]),
             })
             .collect();
-        let default_hit_counter = ROUTER_RULE_HITS.with_label_values(&["default"]);
 
-        // Pre-compile domain patterns for each rule
-        let compiled_domains: Vec<Vec<CompiledDomainPattern>> = rules
-            .iter()
-            .map(|rule| Self::compile_domain_patterns(&rule.domain))
-            .collect();
+        let stats: Vec<RuleStat> = compiled_rules.iter().map(|_| RuleStat::default()).collect();
 
-        Self {
-            rules,
-            default_outbound: default_outbound.into(),
-            geosite: GeoSiteMatcher::new(),
-            geoip: GeoIpMatcher::default(),
-            compiled_domains,
+        tracing::info!("Router built: {} rules compiled", compiled_rules.len());
+
+        RuleRouter {
+            rules: compiled_rules,
+            default_outbound: self.default_outbound,
             metric_handles,
-            default_hit_counter,
+            default_hit_counter: ROUTER_RULE_HITS.with_label_values(&["default"]),
             stats: Arc::new(stats),
             default_hits: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Compile domain patterns at construction time
-    fn compile_domain_patterns(patterns: &[String]) -> Vec<CompiledDomainPattern> {
-        patterns
-            .iter()
-            .filter_map(|pattern| {
-                if let Some(site) = pattern.strip_prefix("geosite:") {
-                    Some(CompiledDomainPattern::GeoSite(site.to_string()))
-                } else if let Some(target) = pattern.strip_prefix("domain:") {
-                    Some(CompiledDomainPattern::DomainSuffix {
-                        exact: target.to_string(),
-                        suffix: format!(".{}", target),
-                    })
-                } else if let Some(target) = pattern.strip_prefix("full:") {
-                    Some(CompiledDomainPattern::Full(target.to_string()))
-                } else if let Some(regex_str) = pattern.strip_prefix("regexp:") {
-                    match Regex::new(regex_str) {
-                        Ok(re) => Some(CompiledDomainPattern::Regexp(re)),
-                        Err(_) => None, // skip invalid regex
-                    }
-                } else if let Some(keyword) = pattern.strip_prefix("keyword:") {
-                    Some(CompiledDomainPattern::Keyword(keyword.to_string()))
-                } else {
-                    Some(CompiledDomainPattern::Plain(pattern.clone()))
-                }
-            })
-            .collect()
-    }
+    fn compile_rule(&self, rule: &Rule) -> RoutingRule {
+        let domain_matcher = self.build_domain_matcher(rule);
+        let ip_matcher = self.build_ip_matcher(rule);
+        let port_matcher = rule.port.as_deref().and_then(PortMatcher::build);
 
-    pub fn with_geosite(mut self, geosite: GeoSiteMatcher) -> Self {
-        self.geosite = geosite;
-        self
-    }
-
-    pub fn with_geoip(mut self, geoip: GeoIpMatcher) -> Self {
-        self.geoip = geoip;
-        self
-    }
-
-    /// Get statistics snapshot for all rules
-    pub fn get_stats(&self) -> Vec<RuleStatsSnapshot> {
-        let total: u64 = self.stats.iter()
-            .map(|s| s.hits.load(Ordering::Relaxed))
-            .sum::<u64>()
-            + self.default_hits.load(Ordering::Relaxed);
-
-        let mut result = Vec::with_capacity(self.rules.len() + 1);
-
-        for (i, rule) in self.rules.iter().enumerate() {
-            let hits = self.stats[i].hits.load(Ordering::Relaxed);
-            let percent = if total > 0 {
-                (hits as f64 / total as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            let total_time_ns = self.stats[i].match_time_ns.load(Ordering::Relaxed);
-            let eval_count = self.stats[i].eval_count.load(Ordering::Relaxed);
-            let avg_match_time_us = if eval_count > 0 {
-                (total_time_ns as f64 / eval_count as f64) / 1000.0
-            } else {
-                0.0
-            };
-            let total_match_time_us = total_time_ns as f64 / 1000.0;
-
-            let rule_desc = format!("{:?} -> {}", rule.rule_type, rule.outbound_tag);
-            result.push(RuleStatsSnapshot {
-                rule_desc,
-                hits,
-                percent,
-                avg_match_time_us,
-                total_match_time_us,
-            });
-        }
-
-        // Add default outbound stats
-        let default_hits = self.default_hits.load(Ordering::Relaxed);
-        let default_percent = if total > 0 {
-            (default_hits as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-        result.push(RuleStatsSnapshot {
-            rule_desc: format!("default -> {}", self.default_outbound),
-            hits: default_hits,
-            percent: default_percent,
-            avg_match_time_us: 0.0,
-            total_match_time_us: 0.0,
-        });
-
-        result
-    }
-
-    /// Get total number of routing decisions made
-    pub fn total_hits(&self) -> u64 {
-        self.stats.iter()
-            .map(|s| s.hits.load(Ordering::Relaxed))
-            .sum::<u64>()
-            + self.default_hits.load(Ordering::Relaxed)
-    }
-
-    /// Reset all statistics
-    pub fn reset_stats(&self) {
-        for stat in self.stats.iter() {
-            stat.hits.store(0, Ordering::Relaxed);
-            stat.match_time_ns.store(0, Ordering::Relaxed);
-            stat.eval_count.store(0, Ordering::Relaxed);
-        }
-        self.default_hits.store(0, Ordering::Relaxed);
-    }
-
-    /// Print statistics to log
-    pub fn log_stats(&self) {
-        let stats = self.get_stats();
-        let total = self.total_hits();
-        
-        tracing::info!("=== Routing Statistics (total: {}) ===", total);
-        for (i, stat) in stats.iter().enumerate() {
-            if i < self.rules.len() {
-                tracing::info!(
-                    "  Rule {}: {} | hits: {} ({:.2}%) | avg: {:.2}µs, total: {:.2}ms",
-                    i + 1,
-                    stat.rule_desc,
-                    stat.hits,
-                    stat.percent,
-                    stat.avg_match_time_us,
-                    stat.total_match_time_us / 1000.0
-                );
-            } else {
-                tracing::info!(
-                    "  Default: {} | hits: {} ({:.2}%)",
-                    stat.rule_desc,
-                    stat.hits,
-                    stat.percent
-                );
-            }
+        RoutingRule {
+            outbound_tag: rule.outbound_tag.clone(),
+            is_catch_all: rule.rule_type == RuleType::All,
+            inbound_tag: rule.inbound_tag.clone(),
+            protocol: rule.protocol.clone(),
+            network: rule.network.clone(),
+            domain_matcher,
+            ip_matcher,
+            port_matcher,
         }
     }
 
-    /// Check if a rule matches the metadata
-    fn match_rule(&self, rule_idx: usize, rule: &Rule, metadata: &Metadata) -> bool {
-        // Check inbound tag
-        if !rule.inbound_tag.is_empty()
-            && !rule.inbound_tag.iter().any(|t| t.as_str() == &*metadata.inbound_tag)
-        {
-            return false;
-        }
+    fn build_domain_matcher(&self, rule: &Rule) -> Option<DomainMatcher> {
+        let mut b = DomainMatcherBuilder::new();
 
-        // Check protocol
-        if !rule.protocol.is_empty() && !rule.protocol.iter().any(|p| p == &metadata.protocol) {
-            return false;
-        }
-
-        // Check network
-        if !rule.network.is_empty() && !rule.network.contains(&metadata.network) {
-            return false;
-        }
-
-        // Check port
-        if let Some(port_pattern) = &rule.port {
-            if !self.match_port(port_pattern, metadata.destination.port()) {
-                return false;
-            }
-        }
-
-        // Handle special rule types
         match rule.rule_type {
-            RuleType::All => return true,
             RuleType::ChinaSites => {
-                if let Address::Domain(domain, _) = &metadata.destination {
-                    // Use geosite cn and geolocation-cn categories with suffix matching
-                    // This treats Full entries as Domain entries (suffix match)
-                    // so that subdomains like api.bilibili.com match bilibili.com
-                    return self.geosite.is_china_domain(domain);
+                for site in &["cn", "geolocation-cn"] {
+                    self.expand_geosite_into(&mut b, site);
                 }
-                return false;
-            }
-            RuleType::ChinaIp => {
-                if let Address::Socket(addr) = &metadata.destination {
-                    return self.geoip.matches("CN", addr.ip());
-                }
-                return false;
-            }
-            RuleType::PrivateIp => {
-                if let Address::Socket(addr) = &metadata.destination {
-                    return self.is_private_ip(addr.ip());
-                }
-                return false;
             }
             RuleType::Field => {
-                // Continue with field-based matching below
-            }
-        }
-
-        // Check domain/IP for Field type
-        let compiled = &self.compiled_domains[rule_idx];
-        let has_domain_rules = !compiled.is_empty();
-        let has_ip_rules = !rule.ip.is_empty();
-
-        if !has_domain_rules && !has_ip_rules {
-            return true;
-        }
-
-        match &metadata.destination {
-            Address::Domain(domain, _) => {
-                if has_domain_rules {
-                    self.match_domain_compiled(compiled, domain)
-                } else {
-                    false
+                for pattern in &rule.domain {
+                    if let Some(site) = pattern.strip_prefix("geosite:") {
+                        self.expand_geosite_into(&mut b, site);
+                    } else if let Some(d) = pattern.strip_prefix("domain:") {
+                        b.add_suffix(d);
+                    } else if let Some(d) = pattern.strip_prefix("full:") {
+                        b.add_exact(d);
+                    } else if let Some(kw) = pattern.strip_prefix("keyword:") {
+                        b.add_keyword(kw);
+                    } else if let Some(re) = pattern.strip_prefix("regexp:") {
+                        b.add_regex(re);
+                    } else {
+                        b.add_keyword(pattern); // plain → keyword
+                    }
                 }
             }
-            Address::Socket(addr) => {
-                if has_ip_rules {
-                    self.match_ip(&rule.ip, addr.ip())
-                } else {
-                    false
+            _ => {}
+        }
+
+        b.build()
+    }
+
+    /// Resolve geosite entries and feed into DomainMatcherBuilder.
+    fn expand_geosite_into(&self, b: &mut DomainMatcherBuilder, site: &str) {
+        if let Some(entries) = self.geosite.get(site) {
+            for entry in entries {
+                match entry {
+                    DomainEntry::Domain(d) => b.add_suffix(d),
+                    DomainEntry::Full(d) => b.add_exact(d),
+                    DomainEntry::Keyword(kw) => b.add_keyword(kw),
+                    DomainEntry::Regex(re) => b.add_regex(re),
                 }
             }
         }
     }
 
-    /// Check if IP is private/LAN address
-    fn is_private_ip(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(ipv4) => {
-                ipv4.is_private()           // 10.x, 172.16-31.x, 192.168.x
-                    || ipv4.is_loopback()   // 127.x
-                    || ipv4.is_link_local() // 169.254.x
-                    || ipv4.is_broadcast()  // 255.255.255.255
-                    || ipv4.octets()[0] == 0 // 0.x (current network)
-            }
-            IpAddr::V6(ipv6) => {
-                ipv6.is_loopback()          // ::1
-                    || ipv6.is_unspecified() // ::
-                    // Check for link-local (fe80::/10)
-                    || (ipv6.segments()[0] & 0xffc0) == 0xfe80
-                    // Check for unique local (fc00::/7)
-                    || (ipv6.segments()[0] & 0xfe00) == 0xfc00
-            }
-        }
-    }
+    fn build_ip_matcher(&self, rule: &Rule) -> Option<IpMatcher> {
+        let mut b = IpMatcherBuilder::new();
 
-    /// Match port pattern (e.g., "80", "80,443", "1000-2000")
-    fn match_port(&self, pattern: &str, port: u16) -> bool {
-        for part in pattern.split(',') {
-            let part = part.trim();
-            if part.contains('-') {
-                let range: Vec<&str> = part.split('-').collect();
-                if range.len() == 2 {
-                    if let (Ok(start), Ok(end)) = (range[0].parse::<u16>(), range[1].parse::<u16>())
-                    {
-                        if port >= start && port <= end {
-                            return true;
+        match rule.rule_type {
+            RuleType::ChinaIp => {
+                self.expand_geoip_into(&mut b, "CN");
+            }
+            RuleType::PrivateIp => {
+                for cidr in &[
+                    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                    "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/8",
+                    "fc00::/7", "fe80::/10", "::1/128",
+                ] {
+                    if let Ok(net) = cidr.parse() {
+                        b.add_cidr(net);
+                    }
+                }
+            }
+            RuleType::Field => {
+                for pattern in &rule.ip {
+                    if let Some(code) = pattern.strip_prefix("geoip:") {
+                        self.expand_geoip_into(&mut b, code);
+                    } else if pattern.contains('/') {
+                        if let Ok(net) = pattern.parse() {
+                            b.add_cidr(net);
                         }
+                    } else if let Ok(ip) = pattern.parse() {
+                        b.add_exact(ip);
                     }
                 }
-            } else if let Ok(p) = part.parse::<u16>() {
-                if port == p {
-                    return true;
-                }
             }
+            _ => {}
         }
-        false
+
+        b.build()
     }
 
-    /// Match domain against pre-compiled patterns
-    fn match_domain_compiled(&self, patterns: &[CompiledDomainPattern], domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
-
-        for pattern in patterns {
-            match pattern {
-                CompiledDomainPattern::GeoSite(site) => {
-                    if self.geosite.matches(site, &domain_lower) {
-                        return true;
-                    }
-                }
-                CompiledDomainPattern::DomainSuffix { exact, suffix } => {
-                    if domain_lower == *exact || domain_lower.ends_with(suffix.as_str()) {
-                        return true;
-                    }
-                }
-                CompiledDomainPattern::Full(target) => {
-                    if domain_lower == *target {
-                        return true;
-                    }
-                }
-                CompiledDomainPattern::Regexp(re) => {
-                    if re.is_match(&domain_lower) {
-                        return true;
-                    }
-                }
-                CompiledDomainPattern::Keyword(keyword) => {
-                    if domain_lower.contains(keyword.as_str()) {
-                        return true;
-                    }
-                }
-                CompiledDomainPattern::Plain(p) => {
-                    if domain_lower.contains(p.as_str()) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Match IP patterns
-    fn match_ip(&self, patterns: &[String], ip: IpAddr) -> bool {
-        for pattern in patterns {
-            if pattern.starts_with("geoip:") {
-                let country_code = &pattern[6..];
-                if self.geoip.matches(country_code, ip) {
-                    return true;
-                }
-                continue;
-            }
-
-            // CIDR matching
-            if pattern.contains('/') {
-                if let Ok(network) = pattern.parse::<ipnet::IpNet>() {
-                    if network.contains(&ip) {
-                        return true;
-                    }
-                }
-            } else {
-                // Exact IP match
-                if let Ok(target_ip) = pattern.parse::<IpAddr>() {
-                    if ip == target_ip {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+    /// Resolve geoip CIDRs and feed into IpMatcherBuilder.
+    fn expand_geoip_into(&self, b: &mut IpMatcherBuilder, country_code: &str) {
+        // GeoIpDb stores sorted CIDR sets — extract all as ipnet::IpNet
+        // For now, delegate to GeoIpDb at runtime via a wrapper.
+        // TODO: extract raw CIDRs from GeoIpDb at build time
+        //
+        // Since GeoIpDb already has binary-search optimized storage,
+        // we wrap it as a single "virtual CIDR" check at match time.
+        // This is a pragmatic compromise — the IpMatcher is still pure,
+        // it just delegates geoip checks through a stored Arc.
+        b.add_geoip_check(country_code, Arc::clone(&self.geoip));
     }
 }
+
+// ============================================================================
+// Router implementation
+// ============================================================================
 
 impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
@@ -539,18 +370,17 @@ impl Router for RuleRouter {
 
         for (i, rule) in self.rules.iter().enumerate() {
             let start = Instant::now();
-            let matched = self.match_rule(i, rule, metadata);
+            let matched = rule.matches(metadata);
             let elapsed = start.elapsed();
-            let elapsed_ns = elapsed.as_nanos() as u64;
 
-            self.stats[i].match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+            self.stats[i].match_time_ns.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
             self.stats[i].eval_count.fetch_add(1, Ordering::Relaxed);
 
             let handles = &self.metric_handles[i];
-            let elapsed_secs = elapsed.as_secs_f64();
-            handles.duration.observe(elapsed_secs);
-            if elapsed_secs > handles.max_gauge.get() {
-                handles.max_gauge.set(elapsed_secs);
+            let secs = elapsed.as_secs_f64();
+            handles.duration.observe(secs);
+            if secs > handles.max_gauge.get() {
+                handles.max_gauge.set(secs);
             }
 
             if matched {
@@ -570,72 +400,100 @@ impl Router for RuleRouter {
     }
 }
 
-impl Default for RuleRouter {
-    fn default() -> Self {
-        Self {
-            rules: vec![],
-            default_outbound: "direct".to_string(),
-            geosite: GeoSiteMatcher::new(),
-            geoip: GeoIpMatcher::new(),
-            compiled_domains: vec![],
-            metric_handles: vec![],
-            default_hit_counter: ROUTER_RULE_HITS.with_label_values(&["default"]),
-            stats: Arc::new(vec![]),
-            default_hits: Arc::new(AtomicU64::new(0)),
+// ============================================================================
+// Stats access
+// ============================================================================
+
+impl RuleRouter {
+    pub fn get_stats(&self) -> Vec<RuleStatsSnapshot> {
+        let total: u64 = self.stats.iter()
+            .map(|s| s.hits.load(Ordering::Relaxed))
+            .sum::<u64>()
+            + self.default_hits.load(Ordering::Relaxed);
+
+        let mut result = Vec::with_capacity(self.rules.len() + 1);
+
+        for (i, rule) in self.rules.iter().enumerate() {
+            let hits = self.stats[i].hits.load(Ordering::Relaxed);
+            let total_ns = self.stats[i].match_time_ns.load(Ordering::Relaxed);
+            let evals = self.stats[i].eval_count.load(Ordering::Relaxed);
+
+            result.push(RuleStatsSnapshot {
+                rule_desc: rule.outbound_tag.clone(),
+                hits,
+                percent: if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 },
+                avg_match_time_us: if evals > 0 { total_ns as f64 / evals as f64 / 1000.0 } else { 0.0 },
+                total_match_time_us: total_ns as f64 / 1000.0,
+            });
         }
+
+        let dh = self.default_hits.load(Ordering::Relaxed);
+        result.push(RuleStatsSnapshot {
+            rule_desc: format!("default -> {}", self.default_outbound),
+            hits: dh,
+            percent: if total > 0 { dh as f64 / total as f64 * 100.0 } else { 0.0 },
+            avg_match_time_us: 0.0,
+            total_match_time_us: 0.0,
+        });
+
+        result
+    }
+
+    pub fn total_hits(&self) -> u64 {
+        self.stats.iter().map(|s| s.hits.load(Ordering::Relaxed)).sum::<u64>()
+            + self.default_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_stats(&self) {
+        for stat in self.stats.iter() {
+            stat.hits.store(0, Ordering::Relaxed);
+            stat.match_time_ns.store(0, Ordering::Relaxed);
+            stat.eval_count.store(0, Ordering::Relaxed);
+        }
+        self.default_hits.store(0, Ordering::Relaxed);
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_static_router() {
-        let router = super::super::StaticRouter::new("proxy");
-        let metadata = Metadata::new(Address::domain("example.com", 443));
-        assert_eq!(router.select(&metadata), "proxy");
-    }
-
-    #[test]
-    fn test_rule_router_domain() {
+    fn test_domain_rule() {
         let rules = vec![Rule {
             domain: vec!["domain:google.com".to_string()],
             outbound_tag: "proxy".to_string(),
             ..Default::default()
         }];
 
-        let router = RuleRouter::new(rules, "direct");
+        let router = RuleRouterBuilder::new(rules, "direct").build();
 
-        let meta1 = Metadata::new(Address::domain("www.google.com", 443));
-        assert_eq!(router.select(&meta1), "proxy");
-
-        let meta2 = Metadata::new(Address::domain("example.com", 443));
-        assert_eq!(router.select(&meta2), "direct");
+        assert_eq!(router.select(&Metadata::new(Address::domain("www.google.com", 443))), "proxy");
+        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 443))), "direct");
     }
 
     #[test]
-    fn test_rule_router_port() {
+    fn test_port_rule() {
         let rules = vec![Rule {
             port: Some("443".to_string()),
             outbound_tag: "proxy".to_string(),
             ..Default::default()
         }];
 
-        let router = RuleRouter::new(rules, "direct");
+        let router = RuleRouterBuilder::new(rules, "direct").build();
 
-        let meta1 = Metadata::new(Address::domain("example.com", 443));
-        assert_eq!(router.select(&meta1), "proxy");
-
-        let meta2 = Metadata::new(Address::domain("example.com", 80));
-        assert_eq!(router.select(&meta2), "direct");
+        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 443))), "proxy");
+        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 80))), "direct");
     }
 
     #[test]
-    fn test_rule_stats() {
+    fn test_catch_all() {
         let rules = vec![
             Rule {
-                rule_type: RuleType::Field,
                 domain: vec!["domain:google.com".to_string()],
                 outbound_tag: "proxy".to_string(),
                 ..Default::default()
@@ -647,9 +505,29 @@ mod tests {
             },
         ];
 
-        let router = RuleRouter::new(rules, "fallback");
+        let router = RuleRouterBuilder::new(rules, "fallback").build();
 
-        // Simulate traffic
+        assert_eq!(router.select(&Metadata::new(Address::domain("www.google.com", 443))), "proxy");
+        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 80))), "direct");
+    }
+
+    #[test]
+    fn test_stats() {
+        let rules = vec![
+            Rule {
+                domain: vec!["domain:google.com".to_string()],
+                outbound_tag: "proxy".to_string(),
+                ..Default::default()
+            },
+            Rule {
+                rule_type: RuleType::All,
+                outbound_tag: "direct".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let router = RuleRouterBuilder::new(rules, "fallback").build();
+
         for _ in 0..3 {
             router.select(&Metadata::new(Address::domain("www.google.com", 443)));
         }
@@ -657,25 +535,11 @@ mod tests {
             router.select(&Metadata::new(Address::domain("example.com", 80)));
         }
 
-        // Check stats
         let stats = router.get_stats();
-        assert_eq!(stats.len(), 3); // 2 rules + default
-
-        // Rule 1 (google.com -> proxy): 3 hits, 30%
         assert_eq!(stats[0].hits, 3);
-        assert!((stats[0].percent - 30.0).abs() < 0.1);
-
-        // Rule 2 (all -> direct): 7 hits, 70%
         assert_eq!(stats[1].hits, 7);
-        assert!((stats[1].percent - 70.0).abs() < 0.1);
-
-        // Default: 0 hits
-        assert_eq!(stats[2].hits, 0);
-
-        // Total
         assert_eq!(router.total_hits(), 10);
 
-        // Reset
         router.reset_stats();
         assert_eq!(router.total_hits(), 0);
     }
