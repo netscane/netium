@@ -46,6 +46,14 @@ impl DomainTrie {
     /// Walks reversed labels; returns true if any ancestor node is terminal.
     pub fn contains(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
+        self.contains_normalized(&domain_lower)
+    }
+
+    /// Test if a normalized (lowercased) domain matches any inserted suffix.
+    ///
+    /// This avoids per-call lowercase allocation in hot paths where callers
+    /// already provide normalized domains.
+    pub fn contains_normalized(&self, domain_lower: &str) -> bool {
         let mut node = &self.root;
 
         for label in domain_lower.rsplit('.') {
@@ -94,6 +102,7 @@ mod tests {
         trie.insert("google.com");
 
         assert!(trie.contains("WWW.GOOGLE.COM"));
+        assert!(trie.contains_normalized("www.google.com"));
     }
 
     #[test]
