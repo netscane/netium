@@ -8,6 +8,7 @@ pub struct RuleStat {
     pub hits: AtomicU64,
     pub match_time_ns: AtomicU64,
     pub eval_count: AtomicU64,
+    pub max_ns: AtomicU64,
 }
 
 impl Default for RuleStat {
@@ -16,6 +17,7 @@ impl Default for RuleStat {
             hits: AtomicU64::new(0),
             match_time_ns: AtomicU64::new(0),
             eval_count: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
         }
     }
 }
@@ -26,6 +28,7 @@ impl Clone for RuleStat {
             hits: AtomicU64::new(self.hits.load(Ordering::Relaxed)),
             match_time_ns: AtomicU64::new(self.match_time_ns.load(Ordering::Relaxed)),
             eval_count: AtomicU64::new(self.eval_count.load(Ordering::Relaxed)),
+            max_ns: AtomicU64::new(self.max_ns.load(Ordering::Relaxed)),
         }
     }
 }
@@ -37,5 +40,5 @@ pub struct RuleStatsSnapshot {
     pub hits: u64,
     pub percent: f64,
     pub avg_match_time_us: f64,
-    pub total_match_time_us: f64,
+    pub max_match_time_us: f64,
 }
