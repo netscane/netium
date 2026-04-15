@@ -44,11 +44,11 @@ impl DomainTrie {
     /// Test if a domain matches any inserted suffix.
     ///
     /// Walks reversed labels; returns true if any ancestor node is terminal.
+    /// IMPORTANT: Domain must be already normalized to lowercase.
     pub fn contains(&self, domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
         let mut node = &self.root;
 
-        for label in domain_lower.rsplit('.') {
+        for label in domain.rsplit('.') {
             match node.children.get(label) {
                 Some(child) => {
                     node = child;
@@ -93,7 +93,9 @@ mod tests {
         let mut trie = DomainTrie::new();
         trie.insert("google.com");
 
-        assert!(trie.contains("WWW.GOOGLE.COM"));
+        // Test that contains() expects already-normalized input
+        assert!(trie.contains("www.google.com"));
+        assert!(!trie.contains("WWW.GOOGLE.COM"));
     }
 
     #[test]

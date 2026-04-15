@@ -318,7 +318,19 @@ impl PortMatcher {
         if self.exact.contains(&port) {
             return true;
         }
-        self.ranges.iter().any(|&(s, e)| port >= s && port <= e)
+        // Binary search for O(log n) range lookup instead of O(n) scan
+        match self.ranges.binary_search_by_key(&port, |&(start, _)| start) {
+            Ok(_) => true, // Port exactly matches a range start
+            Err(idx) => {
+                // Check if port falls within the previous range
+                if idx > 0 {
+                    let &(start, end) = &self.ranges[idx - 1];
+                    port >= start && port <= end
+                } else {
+                    false
+                }
+            }
+        }
     }
 }
 
