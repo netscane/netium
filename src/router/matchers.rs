@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
@@ -142,7 +143,7 @@ impl DomainMatcher {
         }
 
         // 2. Suffix match — O(label_count) trie walk
-        if self.suffix.contains(domain) {
+        if self.suffix.contains_normalized(domain) {
             return true;
         }
 
@@ -318,7 +319,17 @@ impl PortMatcher {
         if self.exact.contains(&port) {
             return true;
         }
-        self.ranges.iter().any(|&(s, e)| port >= s && port <= e)
+        self.ranges
+            .binary_search_by(|&(s, e)| {
+                if port < s {
+                    Ordering::Greater
+                } else if port > e {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .is_ok()
     }
 }
 
