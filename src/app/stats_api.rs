@@ -26,6 +26,8 @@ use super::metrics::{
 /// Global statistics collector
 #[derive(Clone)]
 pub struct StatsCollector {
+    /// Router reference for exporting stats on scrape
+    router: Arc<dyn crate::router::Router>,
     /// Inbound tags
     inbound_tags: Vec<String>,
     /// Outbound tags
@@ -124,7 +126,7 @@ impl OutboundStats {
 
 impl StatsCollector {
     pub fn new(
-        _router: Arc<dyn crate::router::Router>,
+        router: Arc<dyn crate::router::Router>,
         inbound_tags: Vec<String>,
         outbound_tags: Vec<String>,
     ) -> Self {
@@ -140,6 +142,7 @@ impl StatsCollector {
         }
 
         Self {
+            router,
             inbound_tags,
             outbound_tags,
         }
@@ -147,6 +150,16 @@ impl StatsCollector {
 
     pub fn dispatcher_stats(&self) -> Arc<DispatcherStats> {
         Arc::new(DispatcherStats::new())
+    }
+
+    /// Export router rule stats to Prometheus.
+    /// Called on each /metrics scrape, NOT on each routing decision.
+    pub fn export_router_stats(&self) {
+        if let Some(rule_router) = self.router.as_any()
+            .downcast_ref::<crate::router::rule_router::RuleRouter>()
+        {
+            rule_router.export_to_prometheus();
+        }
     }
 
     pub fn get_inbound_stats(&self, tag: &str) -> Option<Arc<InboundStats>> {
@@ -167,7 +180,12 @@ impl StatsCollector {
 }
 
 /// Prometheus metrics endpoint
-async fn get_metrics() -> impl IntoResponse {
+async fn get_metrics(
+    axum::extract::State(collector): axum::extract::State<StatsCollector>,
+) -> impl IntoResponse {
+    // Export router stats to Prometheus gauges before scraping
+    collector.export_router_stats();
+
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
     let mut buffer = Vec::new();
@@ -180,18 +198,19 @@ async fn get_metrics() -> impl IntoResponse {
 }
 
 /// Build the API router (metrics only)
-pub fn build_api_router() -> Router {
+pub fn build_api_router(collector: StatsCollector) -> Router {
     Router::new()
         .route("/metrics", get(get_metrics))
+        .with_state(collector)
 }
 
 /// Start the metrics server
 pub async fn start_api_server(
     addr: SocketAddr,
-    _collector: StatsCollector,
+    collector: StatsCollector,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let app = build_api_router();
+    let app = build_api_router(collector);
 
     info!("Prometheus metrics server listening on http://{}/metrics", addr);
 
