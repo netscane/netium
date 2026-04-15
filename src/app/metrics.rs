@@ -101,8 +101,8 @@ lazy_static! {
 
     // === Router Metrics ===
     
-    /// Rule hits per rule
-    pub static ref ROUTER_RULE_HITS: IntCounterVec = IntCounterVec::new(
+    /// Rule hits per rule (set on scrape, not in hot path)
+    pub static ref ROUTER_RULE_HITS: GaugeVec = GaugeVec::new(
         Opts::new("netium_router_rule_hits_total", "Number of times each routing rule was matched"),
         &["rule"]
     ).unwrap();
@@ -113,16 +113,25 @@ lazy_static! {
         "Total number of routing decisions made"
     ).unwrap();
 
-    /// Rule match duration histogram (in seconds)
+    /// Average rule match duration (in seconds, set on scrape)
+    pub static ref ROUTER_RULE_MATCH_AVG: GaugeVec = GaugeVec::new(
+        Opts::new(
+            "netium_router_rule_match_avg_seconds",
+            "Average time spent matching each routing rule"
+        ),
+        &["rule"]
+    ).unwrap();
+
+    /// Rule match duration histogram (sampled, not every request)
     pub static ref ROUTER_RULE_MATCH_DURATION: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
             "netium_router_rule_match_duration_seconds",
-            "Time spent matching each routing rule"
+            "Sampled time spent matching each routing rule"
         ).buckets(vec![0.000001, 0.000005, 0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01]),
         &["rule"]
     ).unwrap();
 
-    /// Maximum rule match duration (in seconds)
+    /// Maximum rule match duration (in seconds, set on scrape)
     pub static ref ROUTER_RULE_MATCH_MAX: GaugeVec = GaugeVec::new(
         Opts::new(
             "netium_router_rule_match_max_seconds",
@@ -169,6 +178,7 @@ pub fn init_metrics() {
     // Router metrics
     REGISTRY.register(Box::new(ROUTER_RULE_HITS.clone())).ok();
     REGISTRY.register(Box::new(ROUTER_DECISIONS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(ROUTER_RULE_MATCH_AVG.clone())).ok();
     REGISTRY.register(Box::new(ROUTER_RULE_MATCH_DURATION.clone())).ok();
     REGISTRY.register(Box::new(ROUTER_RULE_MATCH_MAX.clone())).ok();
     
