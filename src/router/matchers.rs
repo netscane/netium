@@ -9,11 +9,11 @@
 //! Pattern resolution (geosite:xxx, geoip:CN) is done by the builder.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use regex::{RegexSet, RegexSetBuilder};
 
 use crate::geoip::GeoIpDb;
@@ -28,23 +28,21 @@ use super::domain_trie::DomainTrie;
 /// 1. HashSet for exact match (O(1))
 /// 2. Trie for suffix match (O(label_count))
 /// 3. Keywords for substring match
-/// 4. RegexSet for pattern match (cached to avoid repeated DFA execution)
+/// 4. RegexSet for pattern match (thread-local cached)
 pub struct DomainMatcher {
     exact: HashSet<String>,
     suffix: DomainTrie,
     keywords: Vec<String>,
-    /// Compiled regex matcher + cache.
-    regex: Option<RegexMatcher>,
+    regex_set: Option<RegexSet>,
 }
 
-const REGEX_CACHE_MAX: usize = 8192;
-const REGEX_CACHE_EVICT_COUNT: usize = REGEX_CACHE_MAX / 4;
+/// Per-thread regex result cache — no locking, no contention.
+const REGEX_CACHE_MAX: usize = 4096;
 
-struct RegexMatcher {
-    set: RegexSet,
-    /// Best-effort bounded cache for regex results.
-    /// Key: normalized domain, Value: regex matched or not.
-    cache: RwLock<HashMap<String, bool>>,
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<String, bool>> = RefCell::new(
+        HashMap::with_capacity(256)
+    );
 }
 
 /// Builder that accumulates domain patterns, then compiles into DomainMatcher.
@@ -97,11 +95,10 @@ impl DomainMatcherBuilder {
             return None;
         }
 
-        let regex = if self.regex_patterns.is_empty() {
+        let regex_set = if self.regex_patterns.is_empty() {
             None
         } else {
-            // Use larger DFA cache (8MB) to avoid NFA fallback on complex pattern sets.
-            // Default 2MB is too small for 40+ regex patterns, causing p99 spikes.
+            // Larger DFA cache (8MB) to avoid NFA fallback on complex pattern sets.
             let set = RegexSetBuilder::new(&self.regex_patterns)
                 .dfa_size_limit(8 * 1024 * 1024)
                 .size_limit(16 * 1024 * 1024)
@@ -109,24 +106,20 @@ impl DomainMatcherBuilder {
                 .ok();
 
             // Warmup: force DFA compilation at build time, not at first request.
-            // Without this, the first regex match triggers lazy DFA compilation (~400µs).
             if let Some(ref s) = set {
                 let _ = s.is_match("warmup.example.com");
                 let _ = s.is_match("x.ap-beijing-1.myqcloud.com");
                 let _ = s.is_match("cdn1-epicgames-42.file.myqcloud.com");
             }
 
-            set.map(|set| RegexMatcher {
-                set,
-                cache: RwLock::new(HashMap::with_capacity(256)),
-            })
+            set
         };
 
         Some(DomainMatcher {
             exact: self.exact,
             suffix: self.suffix,
             keywords: self.keywords,
-            regex,
+            regex_set,
         })
     }
 }
@@ -148,54 +141,37 @@ impl DomainMatcher {
             return true;
         }
 
-        // 3. Keyword substring match (intentional broad semantics)
-        if self.matches_keyword(domain) {
+        // 3. Keyword substring match
+        if self.keywords.iter().any(|kw| domain.contains(kw.as_str())) {
             return true;
         }
 
-        // 4. Regex match (with cache to avoid ~50µs DFA cost on repeated domains)
-        self.matches_regex_cached(domain)
+        // 4. Regex match — thread-local cached to avoid DFA cost on repeated domains
+        self.matches_regex(domain)
     }
 
-    fn matches_keyword(&self, domain: &str) -> bool {
-        self.keywords.iter().any(|kw| domain.contains(kw.as_str()))
-    }
-
-    fn matches_regex_cached(&self, domain: &str) -> bool {
-        let Some(regex) = &self.regex else {
+    fn matches_regex(&self, domain: &str) -> bool {
+        let Some(set) = &self.regex_set else {
             return false;
         };
 
-        {
-            let guard = regex.cache.read();
-            if let Some(&hit) = guard.get(domain) {
+        // Thread-local cache: zero contention, each tokio worker has its own.
+        REGEX_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+
+            if let Some(&hit) = cache.get(domain) {
                 return hit;
             }
-        }
 
-        // Slow path: run regex, then cache result.
-        let matched = regex.set.is_match(domain);
-        {
-            let mut guard = regex.cache.write();
-            if guard.len() >= REGEX_CACHE_MAX {
-                evict_regex_cache(&mut guard);
+            let matched = set.is_match(domain);
+
+            if cache.len() >= REGEX_CACHE_MAX {
+                cache.clear();
             }
-            guard.insert(domain.to_string(), matched);
-        }
-        matched
-    }
-}
+            cache.insert(domain.to_string(), matched);
 
-fn evict_regex_cache(cache: &mut HashMap<String, bool>) {
-    // Avoid full clear() to reduce cache-hit oscillation under steady pressure.
-    // HashMap iteration order is not stable, so this is coarse/random-like eviction.
-    let to_remove = REGEX_CACHE_EVICT_COUNT.min(cache.len());
-    if to_remove == 0 {
-        return;
-    }
-    let keys: Vec<String> = cache.keys().take(to_remove).cloned().collect();
-    for key in keys {
-        cache.remove(&key);
+            matched
+        })
     }
 }
 
@@ -417,12 +393,16 @@ mod tests {
     }
 
     #[test]
-    fn test_regex_cache_partial_evict() {
-        let mut cache = HashMap::new();
-        for i in 0..REGEX_CACHE_MAX {
-            cache.insert(format!("d{i}.example.com"), true);
-        }
-        evict_regex_cache(&mut cache);
-        assert_eq!(cache.len(), REGEX_CACHE_MAX - REGEX_CACHE_EVICT_COUNT);
+    fn test_regex_thread_local_cache() {
+        let mut b = DomainMatcherBuilder::new();
+        b.add_regex(r"\.myqcloud\.com$");
+        let m = b.build().unwrap();
+
+        // First call: cache miss, runs regex
+        assert!(m.matches("x.ap-beijing.myqcloud.com"));
+        // Second call: cache hit
+        assert!(m.matches("x.ap-beijing.myqcloud.com"));
+        // Non-match
+        assert!(!m.matches("example.com"));
     }
 }
