@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::app::metrics::ROUTER_DECISIONS_TOTAL;
+use crate::app::metrics::{ROUTER_DECISIONS_TOTAL, ROUTER_RULE_MATCH_DURATION};
 use crate::common::{Address, Metadata, Network};
 use crate::geoip::GeoIpDb;
 use crate::geosite::DomainEntry;
@@ -154,6 +154,14 @@ impl RoutingRule {
 }
 
 // ============================================================================
+// Sampled Prometheus handle
+// ============================================================================
+
+struct MetricHandles {
+    duration: prometheus::Histogram,
+}
+
+// ============================================================================
 // RuleRouter
 // ============================================================================
 
@@ -162,7 +170,10 @@ pub struct RuleRouter {
     default_outbound: String,
     labels: Vec<String>,
 
-    // Stats (lightweight atomics, no Prometheus in hot path)
+    // Sampled Prometheus histogram (written every N evals, not every request)
+    metric_handles: Vec<MetricHandles>,
+
+    // Stats (lightweight atomics, always updated)
     stats: Arc<Vec<RuleStat>>,
     default_hits: Arc<AtomicU64>,
 }
@@ -207,6 +218,12 @@ impl RuleRouterBuilder {
             compiled_rules.push(self.compile_rule(rule));
         }
 
+        let metric_handles: Vec<MetricHandles> = labels.iter()
+            .map(|label| MetricHandles {
+                duration: ROUTER_RULE_MATCH_DURATION.with_label_values(&[label]),
+            })
+            .collect();
+
         let stats: Vec<RuleStat> = compiled_rules.iter().map(|_| RuleStat::default()).collect();
 
         tracing::info!("Router built: {} rules compiled", compiled_rules.len());
@@ -215,6 +232,7 @@ impl RuleRouterBuilder {
             rules: compiled_rules,
             default_outbound: self.default_outbound,
             labels,
+            metric_handles,
             stats: Arc::new(stats),
             default_hits: Arc::new(AtomicU64::new(0)),
         }
@@ -338,6 +356,10 @@ impl RuleRouterBuilder {
 // Router implementation
 // ============================================================================
 
+/// Sampling rate for Prometheus histogram: observe once every N evaluations.
+/// Reduces Histogram::observe() overhead from every request to ~6% of requests.
+const HISTOGRAM_SAMPLE_INTERVAL: u64 = 16;
+
 impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
         ROUTER_DECISIONS_TOTAL.inc();
@@ -347,11 +369,17 @@ impl Router for RuleRouter {
             let matched = rule.matches(metadata);
             let elapsed_ns = start.elapsed().as_nanos() as u64;
 
-            // Lightweight atomic stats — no Prometheus in hot path.
+            // Lightweight atomic stats — always updated.
             let stat = &self.stats[i];
             stat.match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-            stat.eval_count.fetch_add(1, Ordering::Relaxed);
+            let prev_count = stat.eval_count.fetch_add(1, Ordering::Relaxed);
             stat.max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+
+            // Sampled Prometheus histogram: observe once every N evals.
+            // This keeps p99/p50 accuracy while avoiding per-request overhead.
+            if prev_count % HISTOGRAM_SAMPLE_INTERVAL == 0 {
+                self.metric_handles[i].duration.observe(elapsed_ns as f64 / 1_000_000_000.0);
+            }
 
             if matched {
                 stat.hits.fetch_add(1, Ordering::Relaxed);
@@ -415,27 +443,32 @@ impl RuleRouter {
     }
 
     /// Export current stats to Prometheus metrics.
-    /// Call this from the stats/scrape endpoint, NOT from the hot path.
+    /// Called on each /metrics scrape, NOT on each routing decision.
     pub fn export_to_prometheus(&self) {
-        use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_MAX};
+        use crate::app::metrics::{ROUTER_RULE_HITS, ROUTER_RULE_MATCH_AVG, ROUTER_RULE_MATCH_MAX};
 
         for (i, label) in self.labels.iter().enumerate() {
             let stat = &self.stats[i];
             let hits = stat.hits.load(Ordering::Relaxed);
+            let total_ns = stat.match_time_ns.load(Ordering::Relaxed);
+            let evals = stat.eval_count.load(Ordering::Relaxed);
             let max_ns = stat.max_ns.load(Ordering::Relaxed);
 
-            // Reset counter: Prometheus counters are monotonic, so set to current total.
-            let counter = ROUTER_RULE_HITS.with_label_values(&[label]);
-            // IntCounter doesn't support set(), but we registered these at build time.
-            // Use inc_by with delta from last export. For simplicity, just inc_by hits
-            // (this over-counts on repeated exports, but Prometheus rate() handles it).
-            let _ = counter; // Prometheus counters auto-accumulate via scrape.
+            ROUTER_RULE_HITS.with_label_values(&[label]).set(hits as f64);
+            ROUTER_RULE_MATCH_MAX.with_label_values(&[label])
+                .set(max_ns as f64 / 1_000_000_000.0);
 
-            let max_gauge = ROUTER_RULE_MATCH_MAX.with_label_values(&[label]);
-            max_gauge.set(max_ns as f64 / 1_000_000_000.0);
-
-            let _ = hits; // hits are available via get_stats()
+            let avg_secs = if evals > 0 {
+                total_ns as f64 / evals as f64 / 1_000_000_000.0
+            } else {
+                0.0
+            };
+            ROUTER_RULE_MATCH_AVG.with_label_values(&[label]).set(avg_secs);
         }
+
+        // Default rule
+        let dh = self.default_hits.load(Ordering::Relaxed);
+        ROUTER_RULE_HITS.with_label_values(&["default"]).set(dh as f64);
     }
 
     pub fn reset_stats(&self) {
