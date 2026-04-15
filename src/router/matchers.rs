@@ -10,10 +10,12 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lru::LruCache;
 use regex::{RegexSet, RegexSetBuilder};
 
 use crate::geoip::GeoIpDb;
@@ -37,11 +39,14 @@ pub struct DomainMatcher {
 }
 
 /// Per-thread regex result cache — no locking, no contention.
-const REGEX_CACHE_MAX: usize = 4096;
+/// LRU eviction avoids clear() spikes when cache reaches capacity.
+const REGEX_CACHE_MAX: usize = 8192;
 
 thread_local! {
-    static REGEX_CACHE: RefCell<HashMap<String, bool>> = RefCell::new(
-        HashMap::with_capacity(256)
+    static REGEX_CACHE: RefCell<LruCache<String, bool>> = RefCell::new(
+        LruCache::new(
+            NonZeroUsize::new(REGEX_CACHE_MAX).expect("REGEX_CACHE_MAX must be > 0")
+        )
     );
 }
 
@@ -159,16 +164,12 @@ impl DomainMatcher {
         REGEX_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();
 
-            if let Some(&hit) = cache.get(domain) {
-                return hit;
+            if let Some(hit) = cache.get(domain) {
+                return *hit;
             }
 
             let matched = set.is_match(domain);
-
-            if cache.len() >= REGEX_CACHE_MAX {
-                cache.clear();
-            }
-            cache.insert(domain.to_string(), matched);
+            cache.put(domain.to_string(), matched);
 
             matched
         })
