@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -30,12 +30,24 @@ use super::domain_trie::DomainTrie;
 /// 1. HashSet for exact match (O(1))
 /// 2. Trie for suffix match (O(label_count))
 /// 3. Keywords for substring match
-/// 4. RegexSet for pattern match (thread-local cached)
+/// 4. RegexSet for pattern match (TLD-partitioned, thread-local cached)
 pub struct DomainMatcher {
     exact: HashSet<String>,
     suffix: DomainTrie,
     keywords: Vec<String>,
-    regex_set: Option<RegexSet>,
+    regex: Option<TldPartitionedRegex>,
+}
+
+/// Regex patterns partitioned by TLD for faster matching.
+///
+/// Most geosite regex patterns end with a fixed TLD like `\.com$`.
+/// By grouping patterns per TLD, we only run ~10-20 patterns instead of 150+.
+/// Patterns without a recognizable TLD go into `fallback`.
+struct TldPartitionedRegex {
+    /// TLD -> RegexSet for patterns ending with that TLD
+    by_tld: HashMap<Box<str>, RegexSet>,
+    /// Patterns that couldn't be classified by TLD
+    fallback: Option<RegexSet>,
 }
 
 /// Per-thread regex result cache — no locking, no contention.
@@ -100,32 +112,131 @@ impl DomainMatcherBuilder {
             return None;
         }
 
-        let regex_set = if self.regex_patterns.is_empty() {
+        let regex = if self.regex_patterns.is_empty() {
             None
         } else {
-            // Larger DFA cache (8MB) to avoid NFA fallback on complex pattern sets.
-            let set = RegexSetBuilder::new(&self.regex_patterns)
-                .dfa_size_limit(8 * 1024 * 1024)
-                .size_limit(16 * 1024 * 1024)
-                .build()
-                .ok();
-
-            // Warmup: force DFA compilation at build time, not at first request.
-            if let Some(ref s) = set {
-                let _ = s.is_match("warmup.example.com");
-                let _ = s.is_match("x.ap-beijing-1.myqcloud.com");
-                let _ = s.is_match("cdn1-epicgames-42.file.myqcloud.com");
-            }
-
-            set
+            Some(build_tld_partitioned_regex(&self.regex_patterns))
         };
 
         Some(DomainMatcher {
             exact: self.exact,
             suffix: self.suffix,
             keywords: self.keywords,
-            regex_set,
+            regex,
         })
+    }
+}
+
+/// Extract a fixed TLD suffix from a regex pattern.
+///
+/// Recognizes patterns like `(^|\.)stuff\.com$` → Some("com")
+/// Returns None for patterns without a clear fixed TLD ending.
+fn extract_tld_from_regex(pattern: &str) -> Option<&str> {
+    // Must end with `$` and have a literal `.tld$` or `\.tld$`
+    let s = pattern.strip_suffix('$')?;
+
+    // Find the last `\.` or `.` before the TLD
+    let (prefix, tld) = if let Some(pos) = s.rfind("\\.") {
+        (&s[..pos], &s[pos + 2..])
+    } else if let Some(pos) = s.rfind('.') {
+        (&s[..pos], &s[pos + 1..])
+    } else {
+        return None;
+    };
+
+    // TLD must be a simple literal (letters only, no regex metacharacters)
+    if tld.is_empty() || !tld.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        // Could be an alternation like `(com|net|org)` — extract from that
+        return extract_tld_from_alternation(tld).or_else(|| {
+            // Check if prefix ends with alternation containing TLDs
+            None
+        });
+    }
+
+    // Verify the prefix doesn't bleed into the TLD (e.g., character class)
+    let _ = prefix;
+    Some(tld)
+}
+
+/// Handle alternation TLDs like `(com|net|org)` → returns first one for grouping
+fn extract_tld_from_alternation(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+    // Check all alternatives are simple literals
+    let first = inner.split('|').next()?;
+    if inner.split('|').all(|alt| alt.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn build_regex_set(patterns: &[&str]) -> Option<RegexSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let set = RegexSetBuilder::new(patterns)
+        .dfa_size_limit(8 * 1024 * 1024)
+        .size_limit(16 * 1024 * 1024)
+        .build()
+        .ok()?;
+
+    // Warmup DFA
+    let _ = set.is_match("warmup.example.com");
+    Some(set)
+}
+
+fn build_tld_partitioned_regex(patterns: &[String]) -> TldPartitionedRegex {
+    let mut by_tld: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut fallback_patterns: Vec<&str> = Vec::new();
+
+    for pattern in patterns {
+        if let Some(tld) = extract_tld_from_regex(pattern) {
+            by_tld.entry(tld.to_ascii_lowercase()).or_default().push(pattern);
+        } else {
+            fallback_patterns.push(pattern);
+        }
+    }
+
+    let by_tld_compiled: HashMap<Box<str>, RegexSet> = by_tld
+        .into_iter()
+        .filter_map(|(tld, pats)| {
+            build_regex_set(&pats).map(|set| (Box::from(tld.as_str()), set))
+        })
+        .collect();
+
+    let fallback = build_regex_set(&fallback_patterns);
+
+    tracing::debug!(
+        "TLD-partitioned regex: {} TLD groups, {} fallback patterns",
+        by_tld_compiled.len(),
+        fallback_patterns.len(),
+    );
+
+    TldPartitionedRegex {
+        by_tld: by_tld_compiled,
+        fallback,
+    }
+}
+
+impl TldPartitionedRegex {
+    fn is_match(&self, domain: &str) -> bool {
+        // Extract TLD from domain
+        if let Some(tld) = domain.rsplit('.').next() {
+            if let Some(set) = self.by_tld.get(tld) {
+                if set.is_match(domain) {
+                    return true;
+                }
+            }
+        }
+
+        // Always check fallback (patterns without fixed TLD)
+        if let Some(ref fb) = self.fallback {
+            if fb.is_match(domain) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -156,7 +267,7 @@ impl DomainMatcher {
     }
 
     fn matches_regex(&self, domain: &str) -> bool {
-        let Some(set) = &self.regex_set else {
+        let Some(regex) = &self.regex else {
             return false;
         };
 
@@ -168,7 +279,7 @@ impl DomainMatcher {
                 return *hit;
             }
 
-            let matched = set.is_match(domain);
+            let matched = regex.is_match(domain);
             cache.put(domain.to_string(), matched);
 
             matched
@@ -411,11 +522,39 @@ mod tests {
         b.add_regex(r"\.myqcloud\.com$");
         let m = b.build().unwrap();
 
-        // First call: cache miss, runs regex
         assert!(m.matches("x.ap-beijing.myqcloud.com"));
-        // Second call: cache hit
-        assert!(m.matches("x.ap-beijing.myqcloud.com"));
-        // Non-match
+        assert!(m.matches("x.ap-beijing.myqcloud.com")); // cache hit
         assert!(!m.matches("example.com"));
+    }
+
+    #[test]
+    fn test_extract_tld_from_regex() {
+        assert_eq!(extract_tld_from_regex(r"(^|\.)91porn[0-9]?\.store$"), Some("store"));
+        assert_eq!(extract_tld_from_regex(r"(^|\.)18tv[1-5]\.com$"), Some("com"));
+        assert_eq!(extract_tld_from_regex(r"\.myqcloud\.com$"), Some("com"));
+        assert_eq!(extract_tld_from_regex(r"^cdn\d\.file\.myqcloud\.com$"), Some("com"));
+        // Alternation TLD
+        assert_eq!(extract_tld_from_regex(r"(^|\.)foo\.(com|net|org)$"), Some("com"));
+        // No fixed TLD
+        assert_eq!(extract_tld_from_regex(r"^.+-mihayo\.akamaized\.\w+$"), None);
+    }
+
+    #[test]
+    fn test_tld_partitioned_regex() {
+        let mut b = DomainMatcherBuilder::new();
+        // .com pattern
+        b.add_regex(r"(^|\.)91porn[0-9]?\.com$");
+        // .store pattern
+        b.add_regex(r"(^|\.)91porn[0-9]?\.store$");
+        // .net pattern
+        b.add_regex(r"^.+-cdn\.example\.net$");
+        let m = b.build().unwrap();
+
+        assert!(m.matches("91porn5.com"));
+        assert!(m.matches("sub.91porn.com"));
+        assert!(m.matches("91porn3.store"));
+        assert!(m.matches("foo-cdn.example.net"));
+        assert!(!m.matches("91porn5.org")); // .org not in any group
+        assert!(!m.matches("example.com")); // doesn't match pattern
     }
 }

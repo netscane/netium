@@ -360,6 +360,11 @@ impl RuleRouterBuilder {
 /// Reduces Histogram::observe() overhead from every request to ~6% of requests.
 const HISTOGRAM_SAMPLE_INTERVAL: u64 = 16;
 
+/// Measurements above this threshold are discarded as OS scheduling noise.
+/// No domain/IP match should ever take >1ms; such values indicate the thread
+/// was descheduled between Instant::now() and elapsed().
+const OUTLIER_THRESHOLD_NS: u64 = 1_000_000; // 1ms
+
 impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
         ROUTER_DECISIONS_TOTAL.inc();
@@ -369,16 +374,19 @@ impl Router for RuleRouter {
             let matched = rule.matches(metadata);
             let elapsed_ns = start.elapsed().as_nanos() as u64;
 
-            // Lightweight atomic stats — always updated.
             let stat = &self.stats[i];
-            stat.match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-            let prev_count = stat.eval_count.fetch_add(1, Ordering::Relaxed);
-            stat.max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+            stat.eval_count.fetch_add(1, Ordering::Relaxed);
 
-            // Sampled Prometheus histogram: observe once every N evals.
-            // This keeps p99/p50 accuracy while avoiding per-request overhead.
-            if prev_count % HISTOGRAM_SAMPLE_INTERVAL == 0 {
-                self.metric_handles[i].duration.observe(elapsed_ns as f64 / 1_000_000_000.0);
+            // Filter OS scheduling outliers from timing stats.
+            if elapsed_ns < OUTLIER_THRESHOLD_NS {
+                stat.match_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+                stat.max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+
+                // Sampled Prometheus histogram
+                let count = stat.eval_count.load(Ordering::Relaxed);
+                if count % HISTOGRAM_SAMPLE_INTERVAL == 0 {
+                    self.metric_handles[i].duration.observe(elapsed_ns as f64 / 1_000_000_000.0);
+                }
             }
 
             if matched {
