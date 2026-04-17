@@ -52,7 +52,7 @@ struct TldPartitionedRegex {
 
 /// Per-thread regex result cache — no locking, no contention.
 /// LRU eviction avoids clear() spikes when cache reaches capacity.
-const REGEX_CACHE_MAX: usize = 8192;
+const REGEX_CACHE_MAX: usize = 4096;
 
 thread_local! {
     static REGEX_CACHE: RefCell<LruCache<String, bool>> = RefCell::new(

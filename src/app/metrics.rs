@@ -142,6 +142,15 @@ lazy_static! {
 
     // === Connection Duration ===
     
+    /// Dispatch latency: time from request decoded to outbound connect start
+    pub static ref DISPATCH_LATENCY_SECONDS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "netium_dispatch_latency_seconds",
+            "Latency from request received to outbound connect start"
+        ).buckets(vec![0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]),
+        &["outbound"]
+    ).unwrap();
+
     /// Connection duration histogram
     pub static ref CONNECTION_DURATION_SECONDS: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
@@ -183,6 +192,7 @@ pub fn init_metrics() {
     REGISTRY.register(Box::new(ROUTER_RULE_MATCH_MAX.clone())).ok();
     
     // Connection duration
+    REGISTRY.register(Box::new(DISPATCH_LATENCY_SECONDS.clone())).ok();
     REGISTRY.register(Box::new(CONNECTION_DURATION_SECONDS.clone())).ok();
 }
 

@@ -29,8 +29,8 @@ use crate::error::Error;
 use crate::router::Router;
 
 use super::metrics::{
-    ConnectionMetrics, OUTBOUND_BYTES_DOWNLOADED, OUTBOUND_BYTES_UPLOADED,
-    TRAFFIC_BYTES_DOWNLOADED, TRAFFIC_BYTES_UPLOADED,
+    ConnectionMetrics, DISPATCH_LATENCY_SECONDS, OUTBOUND_BYTES_DOWNLOADED,
+    OUTBOUND_BYTES_UPLOADED, TRAFFIC_BYTES_DOWNLOADED, TRAFFIC_BYTES_UPLOADED,
 };
 use super::runtime::Outbound;
 use super::stats_api::{DispatcherStats, OutboundStats};
@@ -60,15 +60,25 @@ pub struct Dispatcher {
     outbounds: HashMap<String, Arc<Outbound>>,
     stats: Option<Arc<DispatcherStats>>,
     outbound_stats: Option<Arc<HashMap<String, Arc<OutboundStats>>>>,
+    /// Pre-cached dispatch latency histogram handles (avoid with_label_values lock)
+    dispatch_latency_handles: HashMap<String, prometheus::Histogram>,
 }
 
 impl Dispatcher {
     pub fn new(router: Arc<dyn Router>, outbounds: HashMap<String, Arc<Outbound>>) -> Self {
+        let dispatch_latency_handles = outbounds.keys()
+            .map(|tag| {
+                let h = DISPATCH_LATENCY_SECONDS.with_label_values(&[tag]);
+                (tag.clone(), h)
+            })
+            .collect();
+
         Self {
             router,
             outbounds,
             stats: None,
             outbound_stats: None,
+            dispatch_latency_handles,
         }
     }
 
@@ -140,6 +150,11 @@ impl Dispatcher {
         );
 
         let conn_metrics = ConnectionMetrics::new(outbound_tag);
+
+        // Record dispatch latency: time from request decoded to connect start.
+        if let Some(h) = self.dispatch_latency_handles.get(outbound_tag) {
+            h.observe(metadata.created_at.elapsed().as_secs_f64());
+        }
 
         // Transport.connect() → Pipeline.process()
         let outbound_stream = match outbound.connect(metadata).await {

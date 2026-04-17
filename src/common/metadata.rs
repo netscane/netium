@@ -3,6 +3,7 @@
 //! Router ONLY depends on Metadata, never on Stream or IO.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::Address;
 
@@ -42,6 +43,8 @@ pub struct Metadata {
     pub inbound_tag: Arc<str>,
     /// Protocol name (vmess, vless, socks, http, direct)
     pub protocol: String,
+    /// When the request was decoded (for dispatch latency tracking)
+    pub created_at: Instant,
 }
 
 impl Metadata {
@@ -53,6 +56,7 @@ impl Metadata {
             network: Network::Tcp,
             inbound_tag: Arc::from(""),
             protocol: String::new(),
+            created_at: Instant::now(),
         }
     }
 
@@ -90,6 +94,7 @@ impl Default for Metadata {
             network: Network::Tcp,
             inbound_tag: Arc::from(""),
             protocol: String::new(),
+            created_at: Instant::now(),
         }
     }
 }
