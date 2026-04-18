@@ -12,9 +12,14 @@
 //! ```
 
 use std::any::Any;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+use lru::LruCache;
+use parking_lot::Mutex;
 
 use crate::app::metrics::{ROUTER_DECISIONS_TOTAL, ROUTER_RULE_MATCH_DURATION};
 use crate::common::{Address, Metadata, Network};
@@ -154,6 +159,78 @@ impl RoutingRule {
 }
 
 // ============================================================================
+// Route cache (thread-local, zero contention)
+// ============================================================================
+
+const ROUTE_CACHE_SIZE: usize = 4096;
+
+thread_local! {
+    static ROUTE_CACHE: RefCell<LruCache<String, usize>> = RefCell::new(
+        LruCache::new(std::num::NonZeroUsize::new(ROUTE_CACHE_SIZE).unwrap())
+    );
+}
+
+// ============================================================================
+// Slow query log
+// ============================================================================
+
+/// Threshold for logging slow routing decisions.
+const SLOW_QUERY_THRESHOLD_NS: u64 = 500_000; // 500µs
+
+/// Max entries kept in the slow query ring buffer.
+const SLOW_QUERY_MAX_ENTRIES: usize = 256;
+
+/// A single slow query record.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SlowQuery {
+    pub destination: String,
+    pub outbound: String,
+    pub elapsed_us: f64,
+    pub timestamp: String,
+}
+
+/// Thread-safe ring buffer for slow queries.
+pub struct SlowQueryLog {
+    entries: Mutex<VecDeque<SlowQuery>>,
+}
+
+impl SlowQueryLog {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(SLOW_QUERY_MAX_ENTRIES)),
+        }
+    }
+
+    fn push(&self, query: SlowQuery) {
+        let mut entries = self.entries.lock();
+        if entries.len() >= SLOW_QUERY_MAX_ENTRIES {
+            entries.pop_front();
+        }
+        entries.push_back(query);
+    }
+
+    /// Get all slow queries (newest last).
+    pub fn snapshot(&self) -> Vec<SlowQuery> {
+        self.entries.lock().iter().cloned().collect()
+    }
+
+    /// Clear all entries.
+    pub fn clear(&self) {
+        self.entries.lock().clear();
+    }
+}
+
+fn fmt_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs();
+    let millis = dur.subsec_millis();
+    // Simple UTC timestamp without pulling in chrono
+    let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, millis)
+}
+
+// ============================================================================
 // Sampled Prometheus handle
 // ============================================================================
 
@@ -176,6 +253,9 @@ pub struct RuleRouter {
     // Stats (lightweight atomics, always updated)
     stats: Arc<Vec<RuleStat>>,
     default_hits: Arc<AtomicU64>,
+
+    // Slow query log (ring buffer, queryable via API)
+    slow_queries: Arc<SlowQueryLog>,
 }
 
 /// Builder for RuleRouter — separates construction from usage.
@@ -235,6 +315,7 @@ impl RuleRouterBuilder {
             metric_handles,
             stats: Arc::new(stats),
             default_hits: Arc::new(AtomicU64::new(0)),
+            slow_queries: Arc::new(SlowQueryLog::new()),
         }
     }
 
@@ -364,15 +445,29 @@ impl Router for RuleRouter {
     fn select(&self, metadata: &Metadata) -> &str {
         ROUTER_DECISIONS_TOTAL.inc();
 
+        // Fast path: check thread-local route cache.
+        let cache_key = Self::cache_key(&metadata.destination);
+        let cached = ROUTE_CACHE.with(|cell| {
+            cell.borrow_mut().get(&cache_key).copied()
+        });
+
+        if let Some(rule_idx) = cached {
+            let stat = &self.stats[rule_idx];
+            stat.eval_count.fetch_add(1, Ordering::Relaxed);
+            stat.hits.fetch_add(1, Ordering::Relaxed);
+            return &self.rules[rule_idx].outbound_tag;
+        }
+
+        // Slow path: evaluate rules.
         let select_start = Instant::now();
 
         for (i, rule) in self.rules.iter().enumerate() {
             let matched = rule.matches(metadata);
 
-            let stat = &self.stats[i];
-            stat.eval_count.fetch_add(1, Ordering::Relaxed);
+            self.stats[i].eval_count.fetch_add(1, Ordering::Relaxed);
 
             if matched {
+                let stat = &self.stats[i];
                 stat.hits.fetch_add(1, Ordering::Relaxed);
 
                 let elapsed_ns = select_start.elapsed().as_nanos() as u64;
@@ -382,6 +477,23 @@ impl Router for RuleRouter {
                 let count = stat.eval_count.load(Ordering::Relaxed);
                 if count % HISTOGRAM_SAMPLE_INTERVAL == 0 {
                     self.metric_handles[i].duration.observe(elapsed_ns as f64 / 1_000_000_000.0);
+                }
+
+                // Populate route cache (only for domain-based rules; IP may change).
+                if matches!(metadata.destination, Address::Domain(_, _)) {
+                    ROUTE_CACHE.with(|cell| {
+                        cell.borrow_mut().put(cache_key.clone(), i);
+                    });
+                }
+
+                // Log slow queries.
+                if elapsed_ns > SLOW_QUERY_THRESHOLD_NS {
+                    self.slow_queries.push(SlowQuery {
+                        destination: metadata.destination.to_string(),
+                        outbound: rule.outbound_tag.clone(),
+                        elapsed_us: elapsed_ns as f64 / 1000.0,
+                        timestamp: fmt_timestamp(),
+                    });
                 }
 
                 return &rule.outbound_tag;
@@ -397,11 +509,15 @@ impl Router for RuleRouter {
     }
 }
 
-// ============================================================================
-// Stats access
-// ============================================================================
-
 impl RuleRouter {
+    /// Build cache key from destination address.
+    fn cache_key(addr: &Address) -> String {
+        match addr {
+            Address::Domain(domain, port) => format!("{}:{}", domain, port),
+            Address::Socket(sa) => sa.to_string(),
+        }
+    }
+
     pub fn get_stats(&self) -> Vec<RuleStatsSnapshot> {
         let total: u64 = self.stats.iter()
             .map(|s| s.hits.load(Ordering::Relaxed))
@@ -480,6 +596,11 @@ impl RuleRouter {
             stat.max_ns.store(0, Ordering::Relaxed);
         }
         self.default_hits.store(0, Ordering::Relaxed);
+    }
+
+    /// Get the slow query log for API exposure.
+    pub fn slow_query_log(&self) -> &Arc<SlowQueryLog> {
+        &self.slow_queries
     }
 }
 

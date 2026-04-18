@@ -162,6 +162,26 @@ impl StatsCollector {
         }
     }
 
+    /// Get slow query log entries.
+    pub fn get_slow_queries(&self) -> Vec<crate::router::rule_router::SlowQuery> {
+        if let Some(rule_router) = self.router.as_any()
+            .downcast_ref::<crate::router::rule_router::RuleRouter>()
+        {
+            rule_router.slow_query_log().snapshot()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Clear the slow query log.
+    pub fn clear_slow_queries(&self) {
+        if let Some(rule_router) = self.router.as_any()
+            .downcast_ref::<crate::router::rule_router::RuleRouter>()
+        {
+            rule_router.slow_query_log().clear();
+        }
+    }
+
     pub fn get_inbound_stats(&self, tag: &str) -> Option<Arc<InboundStats>> {
         if self.inbound_tags.contains(&tag.to_string()) {
             Some(Arc::new(InboundStats::new(tag)))
@@ -197,10 +217,27 @@ async fn get_metrics(
     )
 }
 
+/// Slow query log endpoint — returns recent slow routing decisions as JSON.
+async fn get_slow_queries(
+    axum::extract::State(collector): axum::extract::State<StatsCollector>,
+) -> impl IntoResponse {
+    let queries = collector.get_slow_queries();
+    axum::Json(queries)
+}
+
+/// Clear slow query log.
+async fn delete_slow_queries(
+    axum::extract::State(collector): axum::extract::State<StatsCollector>,
+) -> impl IntoResponse {
+    collector.clear_slow_queries();
+    "OK"
+}
+
 /// Build the API router (metrics only)
 pub fn build_api_router(collector: StatsCollector) -> Router {
     Router::new()
         .route("/metrics", get(get_metrics))
+        .route("/slow-queries", get(get_slow_queries).delete(delete_slow_queries))
         .with_state(collector)
 }
 
