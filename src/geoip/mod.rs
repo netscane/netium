@@ -268,14 +268,28 @@ mod tests {
         assert!(!set.contains(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 1)));
     }
 
-    /*
     #[test]
-    fn test_load_sped_database() {
-        let db = GeoIpDb::load("/home/netium/geoip.dat").unwrap();
+    fn test_check_cn_ips() {
+        let db = GeoIpDb::load("geoip.dat").unwrap();
         assert!(db.is_loaded());
-        assert!(!db.contains("CN", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-        assert!(db.contains("CN", IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5))));
-        assert!(db.contains("US", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+
+        let test_ips = [
+            ("27.44.122.97", true),
+            ("101.35.212.35", true),
+            ("114.110.97.97", true),
+            ("123.234.3.135", true),
+            // known CN
+            ("223.5.5.5", true),
+            // known non-CN
+            ("1.1.1.1", false),
+            ("8.8.8.8", false),
+        ];
+
+        for (ip_str, expect_cn) in &test_ips {
+            let ip: IpAddr = ip_str.parse().unwrap();
+            let result = db.contains("CN", ip);
+            println!("{}: CN={} (expected={})", ip_str, result, expect_cn);
+            assert_eq!(result, *expect_cn, "IP {} expected CN={} but got {}", ip_str, expect_cn, result);
+        }
     }
-    */
 }

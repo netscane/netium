@@ -7,7 +7,7 @@
 //! - `outbound()`: Client-side - connects through upstream SOCKS5 proxy
 
 use async_trait::async_trait;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -188,7 +188,12 @@ async fn read_address(stream: &mut Stream, atyp: u8) -> Result<Address> {
             stream.read_exact(&mut domain).await?;
             let port = read_port(stream).await?;
             let domain = String::from_utf8_lossy(&domain).to_string();
-            Ok(Address::Domain(domain, port))
+            // Normalize: if domain is actually an IP literal, use Socket variant
+            if let Ok(ip) = domain.parse::<IpAddr>() {
+                Ok(Address::Socket(SocketAddr::new(ip, port)))
+            } else {
+                Ok(Address::Domain(domain, port))
+            }
         }
         ATYP_IPV6 => {
             let mut addr = [0u8; 16];

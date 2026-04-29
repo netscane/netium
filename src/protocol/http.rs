@@ -272,7 +272,7 @@ async fn skip_response_headers(reader: &mut BufReader<Stream>) -> Result<()> {
 
 /// Parse host:port string into Address
 fn parse_host_port(s: &str) -> Result<Address> {
-    // Try to parse as socket address first
+    // Try to parse as socket address first (handles "ip:port" format)
     if let Ok(addr) = s.parse() {
         return Ok(Address::Socket(addr));
     }
@@ -290,7 +290,12 @@ fn parse_host_port(s: &str) -> Result<Address> {
     // Remove brackets from IPv6
     let host = host.trim_start_matches('[').trim_end_matches(']');
 
-    Ok(Address::Domain(host.to_string(), port))
+    // Normalize: if host is an IP literal, use Socket variant
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        Ok(Address::Socket(std::net::SocketAddr::new(ip, port)))
+    } else {
+        Ok(Address::Domain(host.to_string(), port))
+    }
 }
 
 // ============================================================================
