@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber::{fmt, EnvFilter};
 
+use netium::app::{Runtime, RuntimeConfig};
 use netium::config::Config;
 use netium::error::Result;
-use netium::app::{Runtime, RuntimeConfig};
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -26,7 +26,10 @@ fn main() -> Result<()> {
             "client" => Config::default_client(),
             "server" => Config::default_server(),
             _ => {
-                eprintln!("Unknown config type: {}. Use 'client' or 'server'", config_type);
+                eprintln!(
+                    "Unknown config type: {}. Use 'client' or 'server'",
+                    config_type
+                );
                 std::process::exit(1);
             }
         };
@@ -39,14 +42,13 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(Level::INFO);
-    
+
     // Use non-blocking writer for async logging
     let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
-    
+
     // Build optimized filter
-    let filter = EnvFilter::from_default_env()
-        .add_directive(log_level.into());
-    
+    let filter = EnvFilter::from_default_env().add_directive(log_level.into());
+
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(filter)
         .with_target(false)
@@ -60,10 +62,9 @@ fn main() -> Result<()> {
         .compact()
         .with_writer(non_blocking)
         .finish();
-    
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
-    
+
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+
     // Keep the guard alive for the entire runtime
     std::mem::forget(_guard);
 
@@ -79,7 +80,7 @@ fn main() -> Result<()> {
 
     // Convert Config to RuntimeConfig using From trait
     let mut runtime_config = RuntimeConfig::from(&config);
-    
+
     // Override API listen from command line
     if args.api_listen.is_some() {
         runtime_config.api_listen = args.api_listen;
@@ -147,12 +148,18 @@ impl Args {
             i += 1;
         }
 
-        Self { config, gen_config, version, api_listen }
+        Self {
+            config,
+            gen_config,
+            version,
+            api_listen,
+        }
     }
 }
 
 fn print_help() {
-    println!(r#"Netium - A modern VPN/proxy tool
+    println!(
+        r#"Netium - A modern VPN/proxy tool
 
 USAGE:
     netium [OPTIONS]
@@ -171,13 +178,13 @@ EXAMPLES:
     netium --gen-config server > server.json
 
 STATS API ENDPOINTS:
-    GET /metrics             Prometheus metrics (for Grafana/Prometheus)
-    GET /api/stats           Overview of all statistics
-    GET /api/stats/dispatcher  Dispatcher stats (connections, traffic)
-    GET /api/stats/router      Router stats (rule hits)
-    GET /api/stats/inbounds    Per-inbound stats
-    GET /api/stats/outbounds   Per-outbound stats
-"#);
+    GET /metrics                 Prometheus metrics
+    GET /slow-queries            Recent slow routing decisions
+    DELETE /slow-queries         Clear slow routing decisions
+    GET /routed-destinations     Catch-all/default routed destinations
+    DELETE /routed-destinations  Clear routed destinations
+"#
+    );
 }
 
 fn print_version() {

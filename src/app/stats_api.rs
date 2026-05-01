@@ -5,22 +5,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{
-    http::header::CONTENT_TYPE,
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
+use axum::{http::header::CONTENT_TYPE, response::IntoResponse, routing::get, Router};
 use prometheus::{Encoder, TextEncoder};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use super::metrics::{
-    init_metrics,
-    DISPATCHER_CONNECTIONS_ACTIVE, DISPATCHER_CONNECTIONS_FAILED, DISPATCHER_CONNECTIONS_TOTAL,
-    INBOUND_BYTES_DOWNLOADED, INBOUND_BYTES_UPLOADED, INBOUND_CONNECTIONS_ACTIVE,
-    INBOUND_CONNECTIONS_TOTAL, OUTBOUND_BYTES_DOWNLOADED, OUTBOUND_BYTES_UPLOADED,
-    OUTBOUND_CONNECTIONS_ACTIVE, OUTBOUND_CONNECTIONS_TOTAL, REGISTRY,
+    init_metrics, DISPATCHER_CONNECTIONS_ACTIVE, DISPATCHER_CONNECTIONS_FAILED,
+    DISPATCHER_CONNECTIONS_TOTAL, INBOUND_BYTES_DOWNLOADED, INBOUND_BYTES_UPLOADED,
+    INBOUND_CONNECTIONS_ACTIVE, INBOUND_CONNECTIONS_TOTAL, OUTBOUND_BYTES_DOWNLOADED,
+    OUTBOUND_BYTES_UPLOADED, OUTBOUND_CONNECTIONS_ACTIVE, OUTBOUND_CONNECTIONS_TOTAL, REGISTRY,
 };
 
 /// Global statistics collector
@@ -68,27 +62,41 @@ pub struct InboundStats {
 impl InboundStats {
     pub fn new(tag: &str) -> Self {
         // Pre-initialize the label to ensure it appears in metrics
-        INBOUND_CONNECTIONS_TOTAL.with_label_values(&[tag]).inc_by(0);
+        INBOUND_CONNECTIONS_TOTAL
+            .with_label_values(&[tag])
+            .inc_by(0);
         INBOUND_CONNECTIONS_ACTIVE.with_label_values(&[tag]).set(0);
         INBOUND_BYTES_UPLOADED.with_label_values(&[tag]).inc_by(0);
         INBOUND_BYTES_DOWNLOADED.with_label_values(&[tag]).inc_by(0);
-        
-        Self { tag: tag.to_string() }
+
+        Self {
+            tag: tag.to_string(),
+        }
     }
 
     pub fn connection_accepted(&self) {
-        INBOUND_CONNECTIONS_TOTAL.with_label_values(&[&self.tag]).inc();
-        INBOUND_CONNECTIONS_ACTIVE.with_label_values(&[&self.tag]).inc();
+        INBOUND_CONNECTIONS_TOTAL
+            .with_label_values(&[&self.tag])
+            .inc();
+        INBOUND_CONNECTIONS_ACTIVE
+            .with_label_values(&[&self.tag])
+            .inc();
     }
 
     pub fn connection_closed(&self) {
-        INBOUND_CONNECTIONS_ACTIVE.with_label_values(&[&self.tag]).dec();
+        INBOUND_CONNECTIONS_ACTIVE
+            .with_label_values(&[&self.tag])
+            .dec();
     }
 
     #[allow(dead_code)]
     pub fn record_traffic(&self, uploaded: u64, downloaded: u64) {
-        INBOUND_BYTES_UPLOADED.with_label_values(&[&self.tag]).inc_by(uploaded);
-        INBOUND_BYTES_DOWNLOADED.with_label_values(&[&self.tag]).inc_by(downloaded);
+        INBOUND_BYTES_UPLOADED
+            .with_label_values(&[&self.tag])
+            .inc_by(uploaded);
+        INBOUND_BYTES_DOWNLOADED
+            .with_label_values(&[&self.tag])
+            .inc_by(downloaded);
     }
 }
 
@@ -100,27 +108,45 @@ pub struct OutboundStats {
 impl OutboundStats {
     pub fn new(tag: &str) -> Self {
         // Pre-initialize the label to ensure it appears in metrics
-        OUTBOUND_CONNECTIONS_TOTAL.with_label_values(&[tag]).inc_by(0);
+        OUTBOUND_CONNECTIONS_TOTAL
+            .with_label_values(&[tag])
+            .inc_by(0);
         OUTBOUND_CONNECTIONS_ACTIVE.with_label_values(&[tag]).set(0);
         OUTBOUND_BYTES_UPLOADED.with_label_values(&[tag]).inc_by(0);
-        OUTBOUND_BYTES_DOWNLOADED.with_label_values(&[tag]).inc_by(0);
-        
-        Self { tag: tag.to_string() }
+        OUTBOUND_BYTES_DOWNLOADED
+            .with_label_values(&[tag])
+            .inc_by(0);
+
+        Self {
+            tag: tag.to_string(),
+        }
     }
 
     pub fn connection_start(&self) {
-        OUTBOUND_CONNECTIONS_TOTAL.with_label_values(&[&self.tag]).inc();
-        OUTBOUND_CONNECTIONS_ACTIVE.with_label_values(&[&self.tag]).inc();
+        OUTBOUND_CONNECTIONS_TOTAL
+            .with_label_values(&[&self.tag])
+            .inc();
+        OUTBOUND_CONNECTIONS_ACTIVE
+            .with_label_values(&[&self.tag])
+            .inc();
     }
 
     pub fn connection_end(&self, uploaded: u64, downloaded: u64) {
-        OUTBOUND_CONNECTIONS_ACTIVE.with_label_values(&[&self.tag]).dec();
-        OUTBOUND_BYTES_UPLOADED.with_label_values(&[&self.tag]).inc_by(uploaded);
-        OUTBOUND_BYTES_DOWNLOADED.with_label_values(&[&self.tag]).inc_by(downloaded);
+        OUTBOUND_CONNECTIONS_ACTIVE
+            .with_label_values(&[&self.tag])
+            .dec();
+        OUTBOUND_BYTES_UPLOADED
+            .with_label_values(&[&self.tag])
+            .inc_by(uploaded);
+        OUTBOUND_BYTES_DOWNLOADED
+            .with_label_values(&[&self.tag])
+            .inc_by(downloaded);
     }
 
     pub fn dec_active(&self) {
-        OUTBOUND_CONNECTIONS_ACTIVE.with_label_values(&[&self.tag]).dec();
+        OUTBOUND_CONNECTIONS_ACTIVE
+            .with_label_values(&[&self.tag])
+            .dec();
     }
 }
 
@@ -155,7 +181,9 @@ impl StatsCollector {
     /// Export router rule stats to Prometheus.
     /// Called on each /metrics scrape, NOT on each routing decision.
     pub fn export_router_stats(&self) {
-        if let Some(rule_router) = self.router.as_any()
+        if let Some(rule_router) = self
+            .router
+            .as_any()
             .downcast_ref::<crate::router::rule_router::RuleRouter>()
         {
             rule_router.export_to_prometheus();
@@ -164,7 +192,9 @@ impl StatsCollector {
 
     /// Get slow query log entries.
     pub fn get_slow_queries(&self) -> Vec<crate::router::rule_router::SlowQuery> {
-        if let Some(rule_router) = self.router.as_any()
+        if let Some(rule_router) = self
+            .router
+            .as_any()
             .downcast_ref::<crate::router::rule_router::RuleRouter>()
         {
             rule_router.slow_query_log().snapshot()
@@ -175,10 +205,38 @@ impl StatsCollector {
 
     /// Clear the slow query log.
     pub fn clear_slow_queries(&self) {
-        if let Some(rule_router) = self.router.as_any()
+        if let Some(rule_router) = self
+            .router
+            .as_any()
             .downcast_ref::<crate::router::rule_router::RuleRouter>()
         {
             rule_router.slow_query_log().clear();
+        }
+    }
+
+    /// Get deduplicated routed destinations.
+    pub fn get_routed_destinations(
+        &self,
+    ) -> Vec<crate::router::rule_router::RoutedDestination> {
+        if let Some(rule_router) = self
+            .router
+            .as_any()
+            .downcast_ref::<crate::router::rule_router::RuleRouter>()
+        {
+            rule_router.routed_destination_log().snapshot()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Clear the routed destination log.
+    pub fn clear_routed_destinations(&self) {
+        if let Some(rule_router) = self
+            .router
+            .as_any()
+            .downcast_ref::<crate::router::rule_router::RuleRouter>()
+        {
+            rule_router.routed_destination_log().clear();
         }
     }
 
@@ -210,7 +268,7 @@ async fn get_metrics(
     let metric_families = REGISTRY.gather();
     let mut buffer = Vec::new();
     encoder.encode(&metric_families, &mut buffer).unwrap();
-    
+
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         buffer,
@@ -233,11 +291,34 @@ async fn delete_slow_queries(
     "OK"
 }
 
+/// Routed destination endpoint — returns deduplicated routed destinations as JSON.
+async fn get_routed_destinations(
+    axum::extract::State(collector): axum::extract::State<StatsCollector>,
+) -> impl IntoResponse {
+    let destinations = collector.get_routed_destinations();
+    axum::Json(destinations)
+}
+
+/// Clear routed destination log.
+async fn delete_routed_destinations(
+    axum::extract::State(collector): axum::extract::State<StatsCollector>,
+) -> impl IntoResponse {
+    collector.clear_routed_destinations();
+    "OK"
+}
+
 /// Build the API router (metrics only)
 pub fn build_api_router(collector: StatsCollector) -> Router {
     Router::new()
         .route("/metrics", get(get_metrics))
-        .route("/slow-queries", get(get_slow_queries).delete(delete_slow_queries))
+        .route(
+            "/slow-queries",
+            get(get_slow_queries).delete(delete_slow_queries),
+        )
+        .route(
+            "/routed-destinations",
+            get(get_routed_destinations).delete(delete_routed_destinations),
+        )
         .with_state(collector)
 }
 
@@ -249,7 +330,10 @@ pub async fn start_api_server(
 ) {
     let app = build_api_router(collector);
 
-    info!("Prometheus metrics server listening on http://{}/metrics", addr);
+    info!(
+        "Prometheus metrics server listening on http://{}/metrics",
+        addr
+    );
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,

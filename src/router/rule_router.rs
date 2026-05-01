@@ -13,7 +13,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,7 +26,9 @@ use crate::common::{Address, Metadata, Network};
 use crate::geoip::GeoIpDb;
 use crate::geosite::DomainEntry;
 
-use super::matchers::{DomainMatcher, DomainMatcherBuilder, IpMatcher, IpMatcherBuilder, PortMatcher};
+use super::matchers::{
+    DomainMatcher, DomainMatcherBuilder, IpMatcher, IpMatcherBuilder, PortMatcher,
+};
 use super::stats::{RuleStat, RuleStatsSnapshot};
 use super::Router;
 
@@ -142,13 +144,14 @@ impl RoutingRule {
 
     fn check_metadata_filters(&self, metadata: &Metadata) -> bool {
         if !self.inbound_tag.is_empty()
-            && !self.inbound_tag.iter().any(|t| t.as_str() == &*metadata.inbound_tag)
+            && !self
+                .inbound_tag
+                .iter()
+                .any(|t| t.as_str() == &*metadata.inbound_tag)
         {
             return false;
         }
-        if !self.protocol.is_empty()
-            && !self.protocol.iter().any(|p| p == &metadata.protocol)
-        {
+        if !self.protocol.is_empty() && !self.protocol.iter().any(|p| p == &metadata.protocol) {
             return false;
         }
         if !self.network.is_empty() && !self.network.contains(&metadata.network) {
@@ -179,6 +182,7 @@ const SLOW_QUERY_THRESHOLD_NS: u64 = 500_000; // 500µs
 
 /// Max entries kept in the slow query ring buffer.
 const SLOW_QUERY_MAX_ENTRIES: usize = 256;
+const ROUTED_DESTINATION_MAX_ENTRIES: usize = 4096;
 
 /// A single slow query record.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -220,9 +224,84 @@ impl SlowQueryLog {
     }
 }
 
+/// Deduplicated routed destination record.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoutedDestination {
+    pub destination: String,
+    pub rule: String,
+    pub hits: u64,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// Thread-safe store for destinations that reached routing.
+pub struct RoutedDestinationLog {
+    entries: Mutex<HashMap<String, RoutedDestination>>,
+}
+
+impl RoutedDestinationLog {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::with_capacity(ROUTED_DESTINATION_MAX_ENTRIES)),
+        }
+    }
+
+    fn record(&self, destination: String, rule: String) {
+        let now = fmt_timestamp();
+        let mut entries = self.entries.lock();
+
+        if let Some(entry) = entries.get_mut(&destination) {
+            entry.hits += 1;
+            entry.last_seen = now;
+            entry.rule = rule;
+            return;
+        }
+
+        if entries.len() >= ROUTED_DESTINATION_MAX_ENTRIES {
+            if let Some(evict_key) = entries
+                .iter()
+                .min_by_key(|(_, entry)| (entry.hits, entry.last_seen.clone()))
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&evict_key);
+            }
+        }
+
+        entries.insert(
+            destination.clone(),
+            RoutedDestination {
+                destination,
+                rule,
+                hits: 1,
+                first_seen: now.clone(),
+                last_seen: now,
+            },
+        );
+    }
+
+    /// Get all routed destinations, sorted by hit count descending.
+    pub fn snapshot(&self) -> Vec<RoutedDestination> {
+        let mut entries: Vec<_> = self.entries.lock().values().cloned().collect();
+        entries.sort_by(|a, b| {
+            b.hits
+                .cmp(&a.hits)
+                .then_with(|| b.last_seen.cmp(&a.last_seen))
+                .then_with(|| a.destination.cmp(&b.destination))
+        });
+        entries
+    }
+
+    /// Clear all entries.
+    pub fn clear(&self) {
+        self.entries.lock().clear();
+    }
+}
+
 fn fmt_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = dur.as_secs();
     let millis = dur.subsec_millis();
     // Simple UTC timestamp without pulling in chrono
@@ -256,6 +335,9 @@ pub struct RuleRouter {
 
     // Slow query log (ring buffer, queryable via API)
     slow_queries: Arc<SlowQueryLog>,
+
+    // Deduplicated routed destinations for manual rule tuning.
+    routed_destinations: Arc<RoutedDestinationLog>,
 }
 
 /// Builder for RuleRouter — separates construction from usage.
@@ -292,13 +374,16 @@ impl RuleRouterBuilder {
         let mut labels = Vec::with_capacity(self.raw_rules.len());
 
         for (i, rule) in self.raw_rules.iter().enumerate() {
-            let label = rule.label.clone()
+            let label = rule
+                .label
+                .clone()
                 .unwrap_or_else(|| format!("rule_{}", i + 1));
             labels.push(label);
             compiled_rules.push(self.compile_rule(rule));
         }
 
-        let metric_handles: Vec<MetricHandles> = labels.iter()
+        let metric_handles: Vec<MetricHandles> = labels
+            .iter()
             .map(|label| MetricHandles {
                 duration: ROUTER_RULE_MATCH_DURATION.with_label_values(&[label]),
             })
@@ -316,6 +401,7 @@ impl RuleRouterBuilder {
             stats: Arc::new(stats),
             default_hits: Arc::new(AtomicU64::new(0)),
             slow_queries: Arc::new(SlowQueryLog::new()),
+            routed_destinations: Arc::new(RoutedDestinationLog::new()),
         }
     }
 
@@ -391,9 +477,15 @@ impl RuleRouterBuilder {
             }
             RuleType::PrivateIp => {
                 for cidr in &[
-                    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                    "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/8",
-                    "fc00::/7", "fe80::/10", "::1/128",
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "127.0.0.0/8",
+                    "169.254.0.0/16",
+                    "0.0.0.0/8",
+                    "fc00::/7",
+                    "fe80::/10",
+                    "::1/128",
                 ] {
                     if let Ok(net) = cidr.parse() {
                         b.add_cidr(net);
@@ -447,14 +539,16 @@ impl Router for RuleRouter {
 
         // Fast path: check thread-local route cache.
         let cache_key = Self::cache_key(&metadata.destination);
-        let cached = ROUTE_CACHE.with(|cell| {
-            cell.borrow_mut().get(&cache_key).copied()
-        });
+        let cached = ROUTE_CACHE.with(|cell| cell.borrow_mut().get(&cache_key).copied());
 
         if let Some(rule_idx) = cached {
             let stat = &self.stats[rule_idx];
             stat.eval_count.fetch_add(1, Ordering::Relaxed);
             stat.hits.fetch_add(1, Ordering::Relaxed);
+            let rule = &self.rules[rule_idx];
+            if rule.is_catch_all {
+                self.record_routed_destination(&metadata.destination, &self.labels[rule_idx]);
+            }
             return &self.rules[rule_idx].outbound_tag;
         }
 
@@ -476,7 +570,9 @@ impl Router for RuleRouter {
 
                 let count = stat.eval_count.load(Ordering::Relaxed);
                 if count % HISTOGRAM_SAMPLE_INTERVAL == 0 {
-                    self.metric_handles[i].duration.observe(elapsed_ns as f64 / 1_000_000_000.0);
+                    self.metric_handles[i]
+                        .duration
+                        .observe(elapsed_ns as f64 / 1_000_000_000.0);
                 }
 
                 // Populate route cache (only for domain-based rules; IP may change).
@@ -496,11 +592,16 @@ impl Router for RuleRouter {
                     });
                 }
 
+                if rule.is_catch_all {
+                    self.record_routed_destination(&metadata.destination, &self.labels[i]);
+                }
+
                 return &rule.outbound_tag;
             }
         }
 
         self.default_hits.fetch_add(1, Ordering::Relaxed);
+        self.record_routed_destination(&metadata.destination, "default");
         &self.default_outbound
     }
 
@@ -518,8 +619,17 @@ impl RuleRouter {
         }
     }
 
+    fn record_routed_destination(&self, destination: &Address, rule: &str) {
+        self.routed_destinations.record(
+            destination.to_string(),
+            rule.to_string(),
+        );
+    }
+
     pub fn get_stats(&self) -> Vec<RuleStatsSnapshot> {
-        let total: u64 = self.stats.iter()
+        let total: u64 = self
+            .stats
+            .iter()
             .map(|s| s.hits.load(Ordering::Relaxed))
             .sum::<u64>()
             + self.default_hits.load(Ordering::Relaxed);
@@ -536,8 +646,16 @@ impl RuleRouter {
             result.push(RuleStatsSnapshot {
                 rule_desc: rule.outbound_tag.clone(),
                 hits,
-                percent: if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 },
-                avg_match_time_us: if evals > 0 { total_ns as f64 / evals as f64 / 1000.0 } else { 0.0 },
+                percent: if total > 0 {
+                    hits as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                },
+                avg_match_time_us: if evals > 0 {
+                    total_ns as f64 / evals as f64 / 1000.0
+                } else {
+                    0.0
+                },
                 max_match_time_us: max_ns as f64 / 1000.0,
             });
         }
@@ -546,7 +664,11 @@ impl RuleRouter {
         result.push(RuleStatsSnapshot {
             rule_desc: format!("default -> {}", self.default_outbound),
             hits: dh,
-            percent: if total > 0 { dh as f64 / total as f64 * 100.0 } else { 0.0 },
+            percent: if total > 0 {
+                dh as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
             avg_match_time_us: 0.0,
             max_match_time_us: 0.0,
         });
@@ -555,7 +677,10 @@ impl RuleRouter {
     }
 
     pub fn total_hits(&self) -> u64 {
-        self.stats.iter().map(|s| s.hits.load(Ordering::Relaxed)).sum::<u64>()
+        self.stats
+            .iter()
+            .map(|s| s.hits.load(Ordering::Relaxed))
+            .sum::<u64>()
             + self.default_hits.load(Ordering::Relaxed)
     }
 
@@ -571,8 +696,11 @@ impl RuleRouter {
             let evals = stat.eval_count.load(Ordering::Relaxed);
             let max_ns = stat.max_ns.load(Ordering::Relaxed);
 
-            ROUTER_RULE_HITS.with_label_values(&[label]).set(hits as f64);
-            ROUTER_RULE_MATCH_MAX.with_label_values(&[label])
+            ROUTER_RULE_HITS
+                .with_label_values(&[label])
+                .set(hits as f64);
+            ROUTER_RULE_MATCH_MAX
+                .with_label_values(&[label])
                 .set(max_ns as f64 / 1_000_000_000.0);
 
             let avg_secs = if evals > 0 {
@@ -580,12 +708,16 @@ impl RuleRouter {
             } else {
                 0.0
             };
-            ROUTER_RULE_MATCH_AVG.with_label_values(&[label]).set(avg_secs);
+            ROUTER_RULE_MATCH_AVG
+                .with_label_values(&[label])
+                .set(avg_secs);
         }
 
         // Default rule
         let dh = self.default_hits.load(Ordering::Relaxed);
-        ROUTER_RULE_HITS.with_label_values(&["default"]).set(dh as f64);
+        ROUTER_RULE_HITS
+            .with_label_values(&["default"])
+            .set(dh as f64);
     }
 
     pub fn reset_stats(&self) {
@@ -601,6 +733,11 @@ impl RuleRouter {
     /// Get the slow query log for API exposure.
     pub fn slow_query_log(&self) -> &Arc<SlowQueryLog> {
         &self.slow_queries
+    }
+
+    /// Get the routed destination log for API exposure.
+    pub fn routed_destination_log(&self) -> &Arc<RoutedDestinationLog> {
+        &self.routed_destinations
     }
 }
 
@@ -622,8 +759,14 @@ mod tests {
 
         let router = RuleRouterBuilder::new(rules, "direct").build();
 
-        assert_eq!(router.select(&Metadata::new(Address::domain("www.google.com", 443))), "proxy");
-        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 443))), "direct");
+        assert_eq!(
+            router.select(&Metadata::new(Address::domain("www.google.com", 443))),
+            "proxy"
+        );
+        assert_eq!(
+            router.select(&Metadata::new(Address::domain("example.com", 443))),
+            "direct"
+        );
     }
 
     #[test]
@@ -636,8 +779,14 @@ mod tests {
 
         let router = RuleRouterBuilder::new(rules, "direct").build();
 
-        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 443))), "proxy");
-        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 80))), "direct");
+        assert_eq!(
+            router.select(&Metadata::new(Address::domain("example.com", 443))),
+            "proxy"
+        );
+        assert_eq!(
+            router.select(&Metadata::new(Address::domain("example.com", 80))),
+            "direct"
+        );
     }
 
     #[test]
@@ -657,8 +806,14 @@ mod tests {
 
         let router = RuleRouterBuilder::new(rules, "fallback").build();
 
-        assert_eq!(router.select(&Metadata::new(Address::domain("www.google.com", 443))), "proxy");
-        assert_eq!(router.select(&Metadata::new(Address::domain("example.com", 80))), "direct");
+        assert_eq!(
+            router.select(&Metadata::new(Address::domain("www.google.com", 443))),
+            "proxy"
+        );
+        assert_eq!(
+            router.select(&Metadata::new(Address::domain("example.com", 80))),
+            "direct"
+        );
     }
 
     #[test]
@@ -692,5 +847,47 @@ mod tests {
 
         router.reset_stats();
         assert_eq!(router.total_hits(), 0);
+    }
+
+    #[test]
+    fn test_routed_destinations_deduplicate_catch_all_hits() {
+        let rules = vec![
+            Rule {
+                domain: vec!["domain:google.com".to_string()],
+                outbound_tag: "proxy".to_string(),
+                ..Default::default()
+            },
+            Rule {
+                rule_type: RuleType::All,
+                outbound_tag: "proxy".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let router = RuleRouterBuilder::new(rules, "proxy").build();
+
+        for _ in 0..3 {
+            router.select(&Metadata::new(Address::domain("example.com", 443)));
+        }
+        router.select(&Metadata::new(Address::domain("www.google.com", 443)));
+
+        let destinations = router.routed_destination_log().snapshot();
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0].destination, "example.com:443");
+        assert_eq!(destinations[0].rule, "rule_2");
+        assert_eq!(destinations[0].hits, 3);
+    }
+
+    #[test]
+    fn test_routed_destinations_record_default_hits() {
+        let router = RuleRouterBuilder::new(Vec::new(), "proxy").build();
+
+        router.select(&Metadata::new(Address::domain("example.com", 443)));
+
+        let destinations = router.routed_destination_log().snapshot();
+        assert_eq!(destinations.len(), 1);
+        assert_eq!(destinations[0].destination, "example.com:443");
+        assert_eq!(destinations[0].rule, "default");
+        assert_eq!(destinations[0].hits, 1);
     }
 }

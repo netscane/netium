@@ -43,6 +43,48 @@ cargo build --release
 ./netium -c server.json
 ```
 
+### Stats API
+
+Enable the stats API from the command line:
+
+```bash
+./netium -c config.json --api 127.0.0.1:9090
+```
+
+Or configure it in JSON:
+
+```json
+{
+    "api": {
+        "listen": "127.0.0.1:9090"
+    }
+}
+```
+
+Available endpoints:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/slow-queries` | Recent slow routing decisions |
+| `DELETE` | `/slow-queries` | Clear slow query records |
+| `GET` | `/routed-destinations` | Deduplicated destinations that hit a catch-all rule or default route |
+| `DELETE` | `/routed-destinations` | Clear routed destination records |
+
+`/routed-destinations` is useful for finding traffic that fell through to broad routing so you can add more specific rules. Example response:
+
+```json
+[
+    {
+        "destination": "example.com:443",
+        "rule": "rule_5",
+        "hits": 12,
+        "first_seen": "10:20:30.001",
+        "last_seen": "10:25:45.123"
+    }
+]
+```
+
 ## Configuration
 
 ### Client Configuration Example
