@@ -63,6 +63,20 @@
     tr:last-child td { border-bottom: 0; }
     .actions { display: flex; flex-wrap: wrap; gap: 6px; }
     .muted { color: var(--muted); }
+    .copy-btn {
+      visibility: hidden;
+      font-size: 11px;
+      height: 22px;
+      padding: 0 6px;
+      margin-left: 4px;
+      cursor: pointer;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #f0f2f5;
+      color: var(--muted);
+    }
+    tr:hover .copy-btn { visibility: visible; }
+    th .copy-btn { visibility: visible; }
 
     .form-section {
       padding: 14px;
@@ -167,7 +181,7 @@
         <table>
           <thead>
             <tr>
-              <th>Destination</th>
+              <th>Destination <button class="copy-btn" onclick="copyAllDests()" title="Copy all destinations">Copy All</button></th>
               <th>Hits</th>
               <th>Last Seen</th>
               <th>Set Outbound</th>
@@ -400,7 +414,7 @@
     function renderObservations() {
       const rows = observations.map(item => `
         <tr>
-          <td>${escapeHtml(item.destination)}</td>
+          <td>${escapeHtml(item.destination)}<button class="copy-btn" onclick="event.stopPropagation();copyDest('${escapeAttr(item.destination)}')" title="Copy">Copy</button></td>
           <td>${item.hits}</td>
           <td>${escapeHtml(item.last_seen)}</td>
           <td><div class="actions">${outbounds.map(tag =>
@@ -476,6 +490,32 @@
 
     function escapeAttr(value) {
       return escapeHtml(value).replace(/\\/g, "\\\\");
+    }
+
+    function copyText(text) {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(() => toast("Copied"), () => toast("Copy failed"));
+        return;
+      }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      toast("Copied");
+    }
+
+    function copyDest(text) {
+      copyText(text);
+    }
+
+    function copyAllDests() {
+      const text = observations.map(o => o.destination).join("\n");
+      if (!text) { toast("Nothing to copy"); return; }
+      copyText(text);
     }
 
     refresh().catch(err => toast(err.message));
