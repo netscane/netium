@@ -480,9 +480,28 @@ pub struct RoutingConfig {
     #[serde(default)]
     pub domain_strategy: DomainStrategy,
 
+    #[serde(default)]
+    pub dynamic: Option<DynamicRoutingConfig>,
+
     /// Routing rules
     #[serde(default)]
     pub rules: Vec<RoutingRule>,
+}
+
+/// Dynamic routing configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicRoutingConfig {
+    /// Enable dynamic routes
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// JSON file used to persist dynamic rules
+    #[serde(default = "default_dynamic_rules_file")]
+    pub file: String,
+}
+
+fn default_dynamic_rules_file() -> String {
+    "./dynamic_routes.json".to_string()
 }
 
 /// Domain resolution strategy
@@ -504,6 +523,10 @@ pub struct RoutingRule {
     /// Optional label for Prometheus metrics
     #[serde(default)]
     pub label: Option<String>,
+
+    /// Record matched destinations for this rule in the stats API
+    #[serde(default)]
+    pub record_destination: bool,
 
     /// Domain patterns
     #[serde(default)]

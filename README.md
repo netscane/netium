@@ -9,6 +9,8 @@ A modern, high-performance proxy tool written in Rust, inspired by V2Ray.
 - **Inbound Protocols** - SOCKS5, HTTP proxy
 - **GeoIP/GeoSite Routing** - Smart traffic routing based on IP and domain rules
 - **Built-in Rule Types** - Simplified routing configuration with `chinasites`, `chinaip`, `privateip`
+- **Dynamic Routing** - Add/edit/remove routing rules at runtime via Web UI or API without restart
+- **Middleware Chain** - Pluggable router stack: StaticRouter → DynamicRouter → fallback
 
 ## Installation
 
@@ -68,21 +70,109 @@ Available endpoints:
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/slow-queries` | Recent slow routing decisions |
 | `DELETE` | `/slow-queries` | Clear slow query records |
-| `GET` | `/routed-destinations` | Deduplicated destinations that hit a catch-all rule or default route |
-| `DELETE` | `/routed-destinations` | Clear routed destination records |
+| `GET` | `/ui` | Embedded route management page |
+| `GET` | `/api/outbounds` | Available outbound tags |
+| `GET` | `/api/observations` | Deduplicated fallback destinations (hitting the default outbound) |
+| `POST` | `/api/observations/clear` | Clear observation records |
+| `GET` | `/api/rules` | List persisted dynamic rules |
+| `POST` | `/api/rules/add` | Add a dynamic rule |
+| `POST` | `/api/rules/edit` | Edit a dynamic rule |
+| `POST` | `/api/rules/remove` | Remove a dynamic rule |
+| `POST` | `/api/rules/enable` | Enable or disable a dynamic rule |
+| `POST` | `/api/rules/reload` | Reload dynamic rules from disk |
+| `POST` | `/api/rules/from-observation` | Create a dynamic rule from an observed destination |
 
-`/routed-destinations` is useful for finding traffic that fell through to broad routing so you can add more specific rules. Example response:
+To observe destinations that fall through to the default outbound, enable dynamic
+routing — unhandled destinations are automatically recorded and surfaced in `/api/observations`.
+Example response:
 
 ```json
 [
     {
         "destination": "example.com:443",
-        "rule": "rule_5",
         "hits": 12,
-        "first_seen": "10:20:30.001",
-        "last_seen": "10:25:45.123"
+        "first_seen": "2026-05-01T10:20:30.001Z",
+        "last_seen": "2026-05-01T10:25:45.123Z"
     }
 ]
+```
+
+Click an outbound tag in the Web UI to create a dynamic rule from an observation.
+
+### Dynamic Routes
+
+Dynamic routes are user-managed rules evaluated after static config rules.
+They are added, edited, or removed at runtime via the Web UI or API without restarting,
+and persist to disk. When a destination matches a dynamic rule, its outbound overrides
+whatever the static router chose. Enable them with:
+
+```json
+{
+    "routing": {
+        "dynamic": {
+            "enabled": true,
+            "file": "./dynamic_routes.json"
+        },
+        "rules": [
+            {
+                "type": "field",
+                "domain": ["geosite:category-ads-all"],
+                "outbound_tag": "reject"
+            },
+            {
+                "type": "chinasites",
+                "outbound_tag": "direct"
+            },
+            {
+                "type": "all",
+                "label": "proxy-fallback",
+                "record_destination": true,
+                "outbound_tag": "proxy"
+            }
+        ]
+    }
+}
+```
+
+When `dynamic.enabled` is `true`, a `DynamicRouter` is added to the middleware chain
+after the `StaticRouter`. Each dynamic rule item has its own
+priority; the compiled groups are sorted ascending so higher-priority items override
+lower-priority ones for the same destination.
+
+Open `http://127.0.0.1:9090/ui` to manage rules from the embedded page.
+
+Dynamic rules are persisted as JSON:
+
+```json
+{
+    "version": 1,
+    "rules": [
+        {
+            "id": "uuid",
+            "enabled": true,
+            "match_type": "domain",
+            "pattern": "example.com",
+            "port": null,
+            "outbound": "direct",
+            "priority": 100,
+            "comment": "created from observation",
+            "created_at": 1704067200,
+            "updated_at": 1704067200
+        }
+    ]
+}
+```
+
+Supported `match_type` values are `exact`, `domain`, `wildcard`, `regex`, `ip`, and `cidr`.
+
+## Architecture
+
+```
+FallbackRouter           ← default outbound + records fallback destinations
+  LoggingRouter          ← slow query tracking
+    CompositeRouter      ← iterates router chain
+      ├── StaticRouter   ← config rules (geosite/geoip/field/all)
+      └── DynamicRouter  ← user-managed rules (optional)
 ```
 
 ## Configuration
@@ -147,6 +237,10 @@ Available endpoints:
         }
     ],
     "routing": {
+        "dynamic": {
+            "enabled": true,
+            "file": "./dynamic_routes.json"
+        },
         "rules": [
             { "type": "field", "domain": ["geosite:category-ads-all"], "outbound_tag": "reject" },
             { "type": "chinasites", "outbound_tag": "direct" },

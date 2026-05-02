@@ -5,10 +5,25 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{http::header::CONTENT_TYPE, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::State,
+    http::{header::CONTENT_TYPE, StatusCode},
+    response::{Html, IntoResponse},
+    routing::{get, post},
+    Json, Router,
+};
 use prometheus::{Encoder, TextEncoder};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
+
+use crate::route::{
+    DynamicRuleInput, DynamicRuleManager, DynamicRuleUpdate,
+    static_route::StaticRouter,
+};
+use crate::route::log::{FallbackDestinationLog, SlowQueryLog};
+use crate::route::log::{FallbackDestination, SlowQuery};
 
 use super::metrics::{
     init_metrics, DISPATCHER_CONNECTIONS_ACTIVE, DISPATCHER_CONNECTIONS_FAILED,
@@ -20,11 +35,11 @@ use super::metrics::{
 /// Global statistics collector
 #[derive(Clone)]
 pub struct StatsCollector {
-    /// Router reference for exporting stats on scrape
-    router: Arc<dyn crate::router::Router>,
-    /// Inbound tags
+    static_router: Arc<StaticRouter>,
+    slow_query_log: Arc<SlowQueryLog>,
+    fallback_log: Arc<FallbackDestinationLog>,
+    dynamic_rules: Option<Arc<DynamicRuleManager>>,
     inbound_tags: Vec<String>,
-    /// Outbound tags
     outbound_tags: Vec<String>,
 }
 
@@ -152,7 +167,10 @@ impl OutboundStats {
 
 impl StatsCollector {
     pub fn new(
-        router: Arc<dyn crate::router::Router>,
+        static_router: Arc<StaticRouter>,
+        slow_query_log: Arc<SlowQueryLog>,
+        fallback_log: Arc<FallbackDestinationLog>,
+        dynamic_rules: Option<Arc<DynamicRuleManager>>,
         inbound_tags: Vec<String>,
         outbound_tags: Vec<String>,
     ) -> Self {
@@ -168,7 +186,10 @@ impl StatsCollector {
         }
 
         Self {
-            router,
+            static_router,
+            slow_query_log,
+            fallback_log,
+            dynamic_rules,
             inbound_tags,
             outbound_tags,
         }
@@ -181,63 +202,40 @@ impl StatsCollector {
     /// Export router rule stats to Prometheus.
     /// Called on each /metrics scrape, NOT on each routing decision.
     pub fn export_router_stats(&self) {
-        if let Some(rule_router) = self
-            .router
-            .as_any()
-            .downcast_ref::<crate::router::rule_router::RuleRouter>()
-        {
-            rule_router.export_to_prometheus();
-        }
+        self.static_router.export_to_prometheus();
     }
 
     /// Get slow query log entries.
-    pub fn get_slow_queries(&self) -> Vec<crate::router::rule_router::SlowQuery> {
-        if let Some(rule_router) = self
-            .router
-            .as_any()
-            .downcast_ref::<crate::router::rule_router::RuleRouter>()
-        {
-            rule_router.slow_query_log().snapshot()
-        } else {
-            Vec::new()
-        }
+    pub fn get_slow_queries(&self) -> Vec<SlowQuery> {
+        self.slow_query_log.snapshot()
     }
 
     /// Clear the slow query log.
     pub fn clear_slow_queries(&self) {
-        if let Some(rule_router) = self
-            .router
-            .as_any()
-            .downcast_ref::<crate::router::rule_router::RuleRouter>()
-        {
-            rule_router.slow_query_log().clear();
-        }
+        self.slow_query_log.clear();
     }
 
-    /// Get deduplicated routed destinations.
-    pub fn get_routed_destinations(
-        &self,
-    ) -> Vec<crate::router::rule_router::RoutedDestination> {
-        if let Some(rule_router) = self
-            .router
-            .as_any()
-            .downcast_ref::<crate::router::rule_router::RuleRouter>()
-        {
-            rule_router.routed_destination_log().snapshot()
-        } else {
-            Vec::new()
-        }
+    /// Get deduplicated fallback destinations.
+    pub fn get_fallback_destinations(&self) -> Vec<FallbackDestination> {
+        self.fallback_log.snapshot()
     }
 
-    /// Clear the routed destination log.
-    pub fn clear_routed_destinations(&self) {
-        if let Some(rule_router) = self
-            .router
-            .as_any()
-            .downcast_ref::<crate::router::rule_router::RuleRouter>()
-        {
-            rule_router.routed_destination_log().clear();
-        }
+    /// Remove a single fallback destination entry.
+    pub fn remove_fallback_destination(&self, destination: &str) {
+        self.fallback_log.remove(destination);
+    }
+
+    /// Clear fallback destinations.
+    pub fn clear_fallback_destinations(&self) {
+        self.fallback_log.clear();
+    }
+
+    pub fn dynamic_rules(&self) -> Option<Arc<DynamicRuleManager>> {
+        self.dynamic_rules.clone()
+    }
+
+    pub fn outbound_tags(&self) -> Vec<String> {
+        self.outbound_tags.clone()
     }
 
     pub fn get_inbound_stats(&self, tag: &str) -> Option<Arc<InboundStats>> {
@@ -257,10 +255,60 @@ impl StatsCollector {
     }
 }
 
+#[derive(Serialize)]
+struct ApiResponse<T: Serialize> {
+    success: bool,
+    message: String,
+    data: T,
+}
+
+fn ok<T: Serialize>(data: T) -> Json<ApiResponse<T>> {
+    Json(ApiResponse {
+        success: true,
+        message: "OK".to_string(),
+        data,
+    })
+}
+
+fn api_error(message: impl Into<String>) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse {
+            success: false,
+            message: message.into(),
+            data: json!(null),
+        }),
+    )
+}
+
+fn dynamic_manager(
+    collector: &StatsCollector,
+) -> std::result::Result<Arc<DynamicRuleManager>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
+    collector
+        .dynamic_rules()
+        .ok_or_else(|| api_error("dynamic routing is not enabled"))
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveRuleRequest {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnableRuleRequest {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FromObservationRequest {
+    destination: String,
+    outbound: String,
+}
+
 /// Prometheus metrics endpoint
-async fn get_metrics(
-    axum::extract::State(collector): axum::extract::State<StatsCollector>,
-) -> impl IntoResponse {
+async fn get_metrics(State(collector): State<StatsCollector>) -> impl IntoResponse {
     // Export router stats to Prometheus gauges before scraping
     collector.export_router_stats();
 
@@ -276,50 +324,163 @@ async fn get_metrics(
 }
 
 /// Slow query log endpoint — returns recent slow routing decisions as JSON.
-async fn get_slow_queries(
-    axum::extract::State(collector): axum::extract::State<StatsCollector>,
-) -> impl IntoResponse {
+async fn get_slow_queries(State(collector): State<StatsCollector>) -> impl IntoResponse {
     let queries = collector.get_slow_queries();
     axum::Json(queries)
 }
 
 /// Clear slow query log.
-async fn delete_slow_queries(
-    axum::extract::State(collector): axum::extract::State<StatsCollector>,
-) -> impl IntoResponse {
+async fn delete_slow_queries(State(collector): State<StatsCollector>) -> impl IntoResponse {
     collector.clear_slow_queries();
     "OK"
 }
 
-/// Routed destination endpoint — returns deduplicated routed destinations as JSON.
-async fn get_routed_destinations(
-    axum::extract::State(collector): axum::extract::State<StatsCollector>,
-) -> impl IntoResponse {
-    let destinations = collector.get_routed_destinations();
-    axum::Json(destinations)
+async fn get_observations(State(collector): State<StatsCollector>) -> impl IntoResponse {
+    ok(collector.get_fallback_destinations())
 }
 
-/// Clear routed destination log.
-async fn delete_routed_destinations(
-    axum::extract::State(collector): axum::extract::State<StatsCollector>,
+async fn clear_observations(State(collector): State<StatsCollector>) -> impl IntoResponse {
+    collector.clear_fallback_destinations();
+    ok(json!({}))
+}
+
+async fn get_outbounds(State(collector): State<StatsCollector>) -> impl IntoResponse {
+    ok(collector.outbound_tags())
+}
+
+async fn get_rules(State(collector): State<StatsCollector>) -> impl IntoResponse {
+    match dynamic_manager(&collector) {
+        Ok(manager) => ok(manager.list()).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn add_rule(
+    State(collector): State<StatsCollector>,
+    Json(input): Json<DynamicRuleInput>,
 ) -> impl IntoResponse {
-    collector.clear_routed_destinations();
-    "OK"
+    match dynamic_manager(&collector)
+        .and_then(|manager| manager.add(input).map_err(|e| api_error(e.to_string())))
+    {
+        Ok(route) => ok(route).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn edit_rule(
+    State(collector): State<StatsCollector>,
+    Json(input): Json<DynamicRuleUpdate>,
+) -> impl IntoResponse {
+    match dynamic_manager(&collector)
+        .and_then(|manager| manager.update(input).map_err(|e| api_error(e.to_string())))
+    {
+        Ok(route) => ok(route).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn remove_rule(
+    State(collector): State<StatsCollector>,
+    Json(input): Json<RemoveRuleRequest>,
+) -> impl IntoResponse {
+    match dynamic_manager(&collector).and_then(|manager| {
+        manager
+            .remove(&input.id)
+            .map_err(|e| api_error(e.to_string()))
+    }) {
+        Ok(()) => ok(json!({})).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn enable_rule(
+    State(collector): State<StatsCollector>,
+    Json(input): Json<EnableRuleRequest>,
+) -> impl IntoResponse {
+    match dynamic_manager(&collector).and_then(|manager| {
+        manager
+            .set_enabled(&input.id, input.enabled)
+            .map_err(|e| api_error(e.to_string()))
+    }) {
+        Ok(route) => ok(route).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn reload_rules(State(collector): State<StatsCollector>) -> impl IntoResponse {
+    match dynamic_manager(&collector)
+        .and_then(|manager| manager.reload().map_err(|e| api_error(e.to_string())))
+    {
+        Ok(rules) => ok(rules).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn rule_from_observation(
+    State(collector): State<StatsCollector>,
+    Json(input): Json<FromObservationRequest>,
+) -> impl IntoResponse {
+    let (pattern, port) = split_destination(&input.destination);
+    let match_type = if pattern.parse::<std::net::IpAddr>().is_ok() {
+        crate::route::DynamicRuleMatchType::Ip
+    } else {
+        crate::route::DynamicRuleMatchType::Domain
+    };
+
+    let route = DynamicRuleInput {
+        enabled: Some(true),
+        match_type,
+        pattern,
+        port,
+        outbound: input.outbound,
+        priority: Some(100),
+        comment: Some("from observation".to_string()),
+    };
+
+    match dynamic_manager(&collector)
+        .and_then(|manager| manager.add(route).map_err(|e| api_error(e.to_string())))
+    {
+        Ok(route) => {
+            collector.remove_fallback_destination(&input.destination);
+            ok(route).into_response()
+        }
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn serve_ui() -> impl IntoResponse {
+    Html(include_str!("../ui/index.html"))
 }
 
 /// Build the API router (metrics only)
 pub fn build_api_router(collector: StatsCollector) -> Router {
     Router::new()
+        .route("/ui", get(serve_ui))
         .route("/metrics", get(get_metrics))
+        .route("/api/outbounds", get(get_outbounds))
+        .route("/api/rules", get(get_rules))
+        .route("/api/rules/add", post(add_rule))
+        .route("/api/rules/edit", post(edit_rule))
+        .route("/api/rules/remove", post(remove_rule))
+        .route("/api/rules/enable", post(enable_rule))
+        .route("/api/rules/reload", post(reload_rules))
+        .route("/api/rules/from-observation", post(rule_from_observation))
+        .route("/api/observations", get(get_observations))
+        .route("/api/observations/clear", post(clear_observations))
         .route(
             "/slow-queries",
             get(get_slow_queries).delete(delete_slow_queries),
         )
-        .route(
-            "/routed-destinations",
-            get(get_routed_destinations).delete(delete_routed_destinations),
-        )
         .with_state(collector)
+}
+
+fn split_destination(destination: &str) -> (String, Option<u16>) {
+    if let Some((host, port)) = destination.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            return (host.trim_matches(['[', ']']).to_string(), Some(port));
+        }
+    }
+    (destination.to_string(), None)
 }
 
 /// Start the metrics server

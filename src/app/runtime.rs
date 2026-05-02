@@ -21,13 +21,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::common::{Address, Result};
 use crate::protocol::{
-    DirectProtocol, HttpProtocol, ProxyProtocol,
-    Socks5Protocol, VmessProtocol, VmessProtocolConfig, VmessSecurity,
+    DirectProtocol, HttpProtocol, ProxyProtocol, Socks5Protocol, VmessProtocol,
+    VmessProtocolConfig, VmessSecurity,
 };
-use crate::router::{Router, RuleRouterBuilder, StaticRouter};
+use crate::route::{DynamicRuleManager, Router};
 use crate::transport::{
-    BlackholeTransport, ChainedLayer, RejectTransport, StreamLayer,
-    TcpTransport, TlsConfig, TlsWrapper, Transport, WebSocketConfig, WebSocketWrapper, MuxManager,
+    BlackholeTransport, ChainedLayer, MuxManager, RejectTransport, StreamLayer, TcpTransport,
+    TlsConfig, TlsWrapper, Transport, WebSocketConfig, WebSocketWrapper,
 };
 
 use super::dispatcher::Dispatcher;
@@ -109,12 +109,20 @@ pub struct WebSocketSettings {
 pub struct RoutingConfig {
     pub rules: Vec<RouteRule>,
     pub default_outbound: String,
+    pub dynamic: Option<DynamicRoutingConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicRoutingConfig {
+    pub enabled: bool,
+    pub file: String,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RouteRule {
     pub rule_type: String,
     pub label: Option<String>,
+    pub record_destination: bool,
     pub inbound_tag: Vec<String>,
     pub domain: Vec<String>,
     pub ip: Vec<String>,
@@ -146,6 +154,11 @@ impl From<&Config> for RuntimeConfig {
             routing: RoutingConfig {
                 rules: config.routing.rules.iter().map(RouteRule::from).collect(),
                 default_outbound,
+                dynamic: config
+                    .routing
+                    .dynamic
+                    .as_ref()
+                    .map(DynamicRoutingConfig::from),
             },
             api_listen: config.api.as_ref().map(|a| a.listen.clone()),
         }
@@ -159,7 +172,10 @@ impl From<&LegacyInbound> for InboundConfig {
             listen: i.listen.to_string(),
             protocol: format!("{:?}", i.protocol).to_lowercase(),
             settings: InboundSettings::from(&i.settings),
-            transport: i.transport.as_ref().map(|t| TransportConfig::from_legacy(t, true)),
+            transport: i
+                .transport
+                .as_ref()
+                .map(|t| TransportConfig::from_legacy(t, true)),
         }
     }
 }
@@ -188,7 +204,10 @@ impl From<&LegacyOutbound> for OutboundConfig {
             tag: o.tag.clone(),
             protocol: format!("{:?}", o.protocol).to_lowercase(),
             settings: OutboundSettings::from_legacy(o),
-            transport: o.transport.as_ref().map(|t| TransportConfig::from_legacy(t, false)),
+            transport: o
+                .transport
+                .as_ref()
+                .map(|t| TransportConfig::from_legacy(t, false)),
         }
     }
 }
@@ -221,17 +240,24 @@ impl OutboundSettings {
 
 impl TransportConfig {
     fn from_legacy(t: &LegacyTransport, _is_inbound: bool) -> Self {
-        let tls = t.tls_settings.as_ref().filter(|tls| tls.enabled).map(|tls| TlsSettings {
-            server_name: tls.server_name.clone(),
-            allow_insecure: tls.allow_insecure,
-            certificate_file: tls.certificate_file.clone(),
-            key_file: tls.key_file.clone(),
-        });
+        let tls = t
+            .tls_settings
+            .as_ref()
+            .filter(|tls| tls.enabled)
+            .map(|tls| TlsSettings {
+                server_name: tls.server_name.clone(),
+                allow_insecure: tls.allow_insecure,
+                certificate_file: tls.certificate_file.clone(),
+                key_file: tls.key_file.clone(),
+            });
 
         let websocket = if t.transport_type == TransportType::WebSocket {
             t.ws_settings.as_ref().map(|ws| WebSocketSettings {
                 path: ws.path.clone(),
-                host: t.tls_settings.as_ref().and_then(|tls| tls.server_name.clone()),
+                host: t
+                    .tls_settings
+                    .as_ref()
+                    .and_then(|tls| tls.server_name.clone()),
             })
         } else {
             None
@@ -239,10 +265,18 @@ impl TransportConfig {
 
         let transport_type = match t.transport_type {
             TransportType::Tcp => {
-                if tls.is_some() { "tls" } else { "tcp" }
+                if tls.is_some() {
+                    "tls"
+                } else {
+                    "tcp"
+                }
             }
             TransportType::WebSocket => {
-                if tls.is_some() { "wss" } else { "ws" }
+                if tls.is_some() {
+                    "wss"
+                } else {
+                    "ws"
+                }
             }
             _ => "tcp",
         };
@@ -260,11 +294,21 @@ impl From<&crate::config::RoutingRule> for RouteRule {
         RouteRule {
             rule_type: r.rule_type.clone(),
             label: r.label.clone(),
+            record_destination: r.record_destination,
             inbound_tag: r.inbound_tag.clone(),
             domain: r.domain.clone(),
             ip: r.ip.clone(),
             port: r.port.clone(),
             outbound_tag: r.outbound_tag.clone(),
+        }
+    }
+}
+
+impl From<&crate::config::DynamicRoutingConfig> for DynamicRoutingConfig {
+    fn from(config: &crate::config::DynamicRoutingConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            file: config.file.clone(),
         }
     }
 }
@@ -292,18 +336,21 @@ pub struct Outbound {
 
 impl Outbound {
     /// Connect and process through pipeline
-    pub async fn connect(&self, metadata: &crate::common::Metadata) -> Result<crate::common::Stream> {
+    pub async fn connect(
+        &self,
+        metadata: &crate::common::Metadata,
+    ) -> Result<crate::common::Stream> {
         let target = self.server.as_ref().unwrap_or(&metadata.destination);
 
         // Mux path: get a stream from mux session
         if let Some(mux) = &self.mux {
             let key = target.to_string();
-            
+
             let dial = || async {
                 let base_stream = self.transport.connect(target).await?;
                 self.pipeline.wrap_session_layer(base_stream).await
             };
-            
+
             let mux_stream = mux.get_stream(&key, dial).await?;
             return self.pipeline.protocol_only(mux_stream, metadata).await;
         }
@@ -353,32 +400,63 @@ impl Runtime {
             outbounds.insert(cfg.tag.clone(), Arc::new(outbound));
         }
 
-        // Build router
-        let router: Arc<dyn Router> = if config.routing.rules.is_empty() {
-            Arc::new(StaticRouter::new(&config.routing.default_outbound))
+        // Load dynamic rule manager (before building router, so it can be injected)
+        let dynamic_rule_manager = if let Some(dynamic) = &config.routing.dynamic {
+            if dynamic.enabled {
+                Some(Arc::new(DynamicRuleManager::load(&dynamic.file)?))
+            } else {
+                None
+            }
         } else {
-            let rules = config.routing.rules.iter()
-                .map(|r| crate::router::rule_router::Rule {
-                    rule_type: crate::router::rule_router::RuleType::from_str(&r.rule_type),
-                    label: r.label.clone(),
-                    inbound_tag: r.inbound_tag.clone(),
-                    domain: r.domain.clone(),
-                    ip: r.ip.clone(),
-                    port: r.port.clone(),
-                    outbound_tag: r.outbound_tag.clone(),
-                    ..Default::default()
-                })
-                .collect();
-            Arc::new(
-                RuleRouterBuilder::new(rules, &config.routing.default_outbound)
-                    .with_geosite(crate::geosite::GeoSite::load_default())
-                    .with_geoip(crate::geoip::GeoIpDb::load_default())
-                    .build()
-            )
+            None
         };
 
+        // Build static router from config rules
+        let static_rules: Vec<crate::route::Rule> = config
+            .routing
+            .rules
+            .iter()
+            .map(|r| crate::route::Rule {
+                rule_type: crate::route::RuleType::from_str(&r.rule_type),
+                label: r.label.clone(),
+                record_destination: r.record_destination,
+                inbound_tag: r.inbound_tag.clone(),
+                domain: r.domain.clone(),
+                ip: r.ip.clone(),
+                port: r.port.clone(),
+                outbound_tag: r.outbound_tag.clone(),
+                ..Default::default()
+            })
+            .collect();
+
+        let static_router = Arc::new(
+            crate::route::StaticRouterBuilder::new(static_rules)
+                .with_geosite(crate::geosite::GeoSite::load_default())
+                .with_geoip(crate::geoip::GeoIpDb::load_default())
+                .build(),
+        );
+
+        // Chain routers: static first, then dynamic (if enabled)
+        let mut routers: Vec<Arc<dyn Router>> = vec![static_router.clone()];
+        if let Some(mgr) = &dynamic_rule_manager {
+            routers.push(Arc::new(crate::route::DynamicRouter::new(mgr.clone())));
+        }
+
+        let composite = Arc::new(crate::route::composite::CompositeRouter::new(routers));
+        let logging = Arc::new(crate::route::logging::LoggingRouter::new(composite));
+        let slow_query_log = logging.slow_query_log().clone();
+        let router = Arc::new(crate::route::FallbackRouter::new(logging, &config.routing.default_outbound));
+        let fallback_log = router.fallback_log().clone();
+
         // Stats
-        let stats_collector = StatsCollector::new(router.clone(), inbound_tags.clone(), outbound_tags);
+        let stats_collector = StatsCollector::new(
+            static_router.clone(),
+            slow_query_log,
+            fallback_log,
+            dynamic_rule_manager.clone(),
+            inbound_tags.clone(),
+            outbound_tags,
+        );
 
         let mut inbound_stats_map = HashMap::new();
         for tag in &inbound_tags {
@@ -399,7 +477,7 @@ impl Runtime {
         let dispatcher = Arc::new(
             Dispatcher::new(router.clone(), outbounds)
                 .with_stats(stats_collector.dispatcher_stats())
-                .with_outbound_stats(Arc::new(outbound_stats_map))
+                .with_outbound_stats(Arc::new(outbound_stats_map)),
         );
 
         // Build inbounds
@@ -429,7 +507,9 @@ impl Runtime {
     fn build_inbound(config: &InboundConfig) -> Result<Inbound> {
         let transport: Arc<dyn Transport> = Arc::new(TcpTransport::new());
         let protocol = Self::build_protocol(&config.protocol, &config.settings)?;
-        let layer = config.transport.as_ref()
+        let layer = config
+            .transport
+            .as_ref()
             .and_then(|t| Self::build_stream_layer(t).ok().flatten());
 
         let mut builder = InboundPipeline::builder(&config.tag);
@@ -462,7 +542,9 @@ impl Runtime {
         };
 
         let protocol = Self::build_outbound_protocol(&config.protocol, &config.settings)?;
-        let layer = config.transport.as_ref()
+        let layer = config
+            .transport
+            .as_ref()
             .and_then(|t| Self::build_stream_layer(t).ok().flatten());
 
         let server = match (&config.settings.address, config.settings.port) {
@@ -490,7 +572,9 @@ impl Runtime {
             "socks" | "socks5" => Arc::new(Socks5Protocol::new(Default::default())),
             "http" => Arc::new(HttpProtocol::new(Default::default())),
             "vmess" => {
-                let uuid = settings.users.first()
+                let uuid = settings
+                    .users
+                    .first()
                     .and_then(|u| uuid::Uuid::parse_str(&u.uuid).ok())
                     .unwrap_or_else(uuid::Uuid::nil);
                 Arc::new(VmessProtocol::new(VmessProtocolConfig {
@@ -503,15 +587,22 @@ impl Runtime {
         })
     }
 
-    fn build_outbound_protocol(name: &str, settings: &OutboundSettings) -> Result<Arc<dyn ProxyProtocol>> {
+    fn build_outbound_protocol(
+        name: &str,
+        settings: &OutboundSettings,
+    ) -> Result<Arc<dyn ProxyProtocol>> {
         Ok(match name {
             "socks" | "socks5" => Arc::new(Socks5Protocol::new(Default::default())),
             "http" => Arc::new(HttpProtocol::new(Default::default())),
             "vmess" => {
-                let uuid = settings.uuid.as_ref()
+                let uuid = settings
+                    .uuid
+                    .as_ref()
                     .and_then(|s| uuid::Uuid::parse_str(s).ok())
                     .unwrap_or_else(uuid::Uuid::nil);
-                let security = settings.security.as_deref()
+                let security = settings
+                    .security
+                    .as_deref()
                     .map(VmessSecurity::from_str)
                     .unwrap_or(VmessSecurity::Auto);
                 Arc::new(VmessProtocol::new(VmessProtocolConfig {
@@ -530,36 +621,52 @@ impl Runtime {
         Ok(match config.transport_type.as_str() {
             "tcp" | "" => None,
             "tls" => {
-                let tls_config = config.tls.as_ref().map(|t| TlsConfig {
-                    server_name: t.server_name.clone(),
-                    allow_insecure: t.allow_insecure,
-                    alpn: vec![],
-                    certificate_file: t.certificate_file.clone(),
-                    key_file: t.key_file.clone(),
-                }).unwrap_or_default();
+                let tls_config = config
+                    .tls
+                    .as_ref()
+                    .map(|t| TlsConfig {
+                        server_name: t.server_name.clone(),
+                        allow_insecure: t.allow_insecure,
+                        alpn: vec![],
+                        certificate_file: t.certificate_file.clone(),
+                        key_file: t.key_file.clone(),
+                    })
+                    .unwrap_or_default();
                 Some(Arc::new(TlsWrapper::new(tls_config)))
             }
             "ws" | "websocket" => {
-                let ws_config = config.websocket.as_ref().map(|w| WebSocketConfig {
-                    path: w.path.clone(),
-                    host: w.host.clone(),
-                    headers: vec![],
-                }).unwrap_or_default();
+                let ws_config = config
+                    .websocket
+                    .as_ref()
+                    .map(|w| WebSocketConfig {
+                        path: w.path.clone(),
+                        host: w.host.clone(),
+                        headers: vec![],
+                    })
+                    .unwrap_or_default();
                 Some(Arc::new(WebSocketWrapper::new(ws_config)))
             }
             "wss" => {
-                let tls_config = config.tls.as_ref().map(|t| TlsConfig {
-                    server_name: t.server_name.clone(),
-                    allow_insecure: t.allow_insecure,
-                    alpn: vec![],
-                    certificate_file: t.certificate_file.clone(),
-                    key_file: t.key_file.clone(),
-                }).unwrap_or_default();
-                let ws_config = config.websocket.as_ref().map(|w| WebSocketConfig {
-                    path: w.path.clone(),
-                    host: w.host.clone().or_else(|| tls_config.server_name.clone()),
-                    headers: vec![],
-                }).unwrap_or_default();
+                let tls_config = config
+                    .tls
+                    .as_ref()
+                    .map(|t| TlsConfig {
+                        server_name: t.server_name.clone(),
+                        allow_insecure: t.allow_insecure,
+                        alpn: vec![],
+                        certificate_file: t.certificate_file.clone(),
+                        key_file: t.key_file.clone(),
+                    })
+                    .unwrap_or_default();
+                let ws_config = config
+                    .websocket
+                    .as_ref()
+                    .map(|w| WebSocketConfig {
+                        path: w.path.clone(),
+                        host: w.host.clone().or_else(|| tls_config.server_name.clone()),
+                        headers: vec![],
+                    })
+                    .unwrap_or_default();
 
                 let chained = ChainedLayer::new()
                     .push(Arc::new(TlsWrapper::new(tls_config)))
@@ -581,7 +688,9 @@ impl Runtime {
             let inbound_stat = self.inbound_stats.get(&inbound.tag).cloned();
 
             let handle = tokio::spawn(async move {
-                if let Err(e) = run_inbound(inbound, dispatcher, &mut shutdown_rx, inbound_stat).await {
+                if let Err(e) =
+                    run_inbound(inbound, dispatcher, &mut shutdown_rx, inbound_stat).await
+                {
                     error!("Inbound error: {}", e);
                 }
             });
@@ -631,7 +740,9 @@ async fn run_inbound(
     let listener = inbound.transport.bind(&inbound.listen).await?;
     info!(
         "[{}] Listening on {} (protocol: {})",
-        inbound.tag, inbound.listen, inbound.pipeline.protocol_name()
+        inbound.tag,
+        inbound.listen,
+        inbound.pipeline.protocol_name()
     );
 
     let mut conn_count: u64 = 0;
@@ -697,14 +808,17 @@ fn parse_listen_address(s: &str) -> Result<Address> {
     }
 
     if let Some((host, port)) = s.rsplit_once(':') {
-        let port: u16 = port.parse().map_err(|_| {
-            crate::error::Error::Config(format!("Invalid port in address: {}", s))
-        })?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| crate::error::Error::Config(format!("Invalid port in address: {}", s)))?;
         if let Ok(ip) = host.parse() {
             return Ok(Address::Socket(std::net::SocketAddr::new(ip, port)));
         }
         return Ok(Address::Domain(host.to_string(), port));
     }
 
-    Err(crate::error::Error::Config(format!("Invalid listen address: {}", s)))
+    Err(crate::error::Error::Config(format!(
+        "Invalid listen address: {}",
+        s
+    )))
 }

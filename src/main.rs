@@ -178,11 +178,16 @@ EXAMPLES:
     netium --gen-config server > server.json
 
 STATS API ENDPOINTS:
+    GET /ui                      Embedded route management page
     GET /metrics                 Prometheus metrics
     GET /slow-queries            Recent slow routing decisions
     DELETE /slow-queries         Clear slow routing decisions
-    GET /routed-destinations     Catch-all/default routed destinations
-    DELETE /routed-destinations  Clear routed destinations
+    GET /api/observations        Recorded routing observations
+    POST /api/observations/clear Clear routing observations
+    GET /api/rules               Dynamic rule list
+    POST /api/rules/add          Add dynamic rule
+    POST /api/rules/edit         Edit dynamic rule
+    POST /api/rules/remove       Remove dynamic rule
 "#
     );
 }

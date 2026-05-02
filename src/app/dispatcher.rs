@@ -26,7 +26,7 @@ use tracing::debug;
 
 use crate::common::{Metadata, Result, Stream};
 use crate::error::Error;
-use crate::router::Router;
+use crate::route::FallbackRouter;
 
 use super::metrics::{
     ConnectionMetrics, DISPATCH_LATENCY_SECONDS, OUTBOUND_BYTES_DOWNLOADED,
@@ -56,17 +56,17 @@ const RELAY_BUFFER_SIZE: usize = 32 * 1024;
 ///
 /// The Dispatcher is protocol-agnostic - it only works with Stream and Metadata.
 pub struct Dispatcher {
-    router: Arc<dyn Router>,
+    router: Arc<FallbackRouter>,
     outbounds: HashMap<String, Arc<Outbound>>,
     stats: Option<Arc<DispatcherStats>>,
     outbound_stats: Option<Arc<HashMap<String, Arc<OutboundStats>>>>,
-    /// Pre-cached dispatch latency histogram handles (avoid with_label_values lock)
     dispatch_latency_handles: HashMap<String, prometheus::Histogram>,
 }
 
 impl Dispatcher {
-    pub fn new(router: Arc<dyn Router>, outbounds: HashMap<String, Arc<Outbound>>) -> Self {
-        let dispatch_latency_handles = outbounds.keys()
+    pub fn new(router: Arc<FallbackRouter>, outbounds: HashMap<String, Arc<Outbound>>) -> Self {
+        let dispatch_latency_handles = outbounds
+            .keys()
             .map(|tag| {
                 let h = DISPATCH_LATENCY_SECONDS.with_label_values(&[tag]);
                 (tag.clone(), h)
@@ -110,13 +110,13 @@ impl Dispatcher {
         let outbound_tag = self.router.select(&metadata);
         let outbound = self
             .outbounds
-            .get(outbound_tag)
+            .get(&outbound_tag)
             .ok_or_else(|| Error::Config(format!("Unknown outbound: {}", outbound_tag)))?;
 
         let outbound_stat = self
             .outbound_stats
             .as_ref()
-            .and_then(|m| m.get(outbound_tag).cloned());
+            .and_then(|m| m.get(&outbound_tag).cloned());
 
         if let Some(stat) = &outbound_stat {
             stat.connection_start();
@@ -127,7 +127,7 @@ impl Dispatcher {
             &metadata,
             inbound_stream,
             outbound,
-            outbound_tag,
+            &outbound_tag,
             outbound_stat,
             start,
         )

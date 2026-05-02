@@ -38,7 +38,7 @@
 //! ├── common/          # Core types: Stream, Metadata, Address
 //! ├── transport/       # Transport + StreamLayer
 //! ├── protocol/        # ProxyProtocol implementations
-//! ├── router/          # Router implementations
+//! ├── route/           # Router implementations
 //! └── app/             # Dispatcher, Runtime, Pipeline
 //! ```
 
@@ -49,7 +49,7 @@ pub mod error;
 // Layered architecture
 pub mod transport;
 pub mod protocol;
-pub mod router;
+pub mod route;
 pub mod app;
 
 // Supporting modules
@@ -67,5 +67,5 @@ pub use config::Config;
 pub use app::{Dispatcher, Runtime, InboundPipeline, OutboundPipeline};
 pub use app::runtime::{Inbound, Outbound};
 pub use protocol::ProxyProtocol;
-pub use router::Router;
+pub use route::FallbackRouter;
 pub use transport::{Transport, StreamLayer};
