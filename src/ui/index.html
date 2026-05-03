@@ -89,6 +89,7 @@
     button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
     button.danger { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
     button.danger:hover { background: var(--danger); color: white; }
+    button.sm { height: 26px; padding: 0 8px; font-size: 12px; }
 
     /* Search */
     .search-box {
@@ -156,7 +157,7 @@
     .badge-outbound { background: #f0e6ff; color: #6b21a8; }
     .badge-priority { background: #fff7ed; color: #c2410c; }
 
-    .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .actions { display: flex; flex-wrap: nowrap; gap: 4px; }
     .muted { color: var(--muted); font-size: 13px; }
     .copy-btn {
       visibility: hidden;
@@ -345,14 +346,12 @@
 <body>
   <header>
     <h1>Netium Routes</h1>
-    <div class="header-actions">
-      <button onclick="refresh()">Refresh</button>
-    </div>
   </header>
   <main>
     <div class="tabs">
       <button id="tabObservations" class="tab active" onclick="showTab('observations')">Observations<span id="obsCount" class="count hidden">0</span></button>
       <button id="tabRules" class="tab" onclick="showTab('rules')">Rules<span id="rulesCount" class="count hidden">0</span></button>
+      <button id="tabSlowQueries" class="tab" onclick="showTab('slowQueries')">Slow Queries<span id="sqCount" class="count hidden">0</span></button>
     </div>
 
     <!-- Observations Tab -->
@@ -364,6 +363,7 @@
           </div>
         </div>
         <div class="toolbar-right">
+          <button onclick="refresh()">Refresh</button>
           <button class="danger" onclick="clearObservations()">Clear All</button>
         </div>
       </div>
@@ -371,7 +371,7 @@
         <table>
           <thead>
             <tr>
-              <th>Destination <button class="copy-btn" onclick="copyAllDests()" title="Copy all">Copy All</button></th>
+              <th>Destination <button class="copy-btn" onclick="copyAllDests()" title="Copy all destinations">Copy All</button></th>
               <th>Hits</th>
               <th>Last Seen</th>
               <th>Set Outbound</th>
@@ -406,12 +406,41 @@
               <th>Pattern</th>
               <th>Outbound</th>
               <th>Priority</th>
-              <th style="width:120px">Actions</th>
+              <th style="width:100px">Actions</th>
             </tr>
           </thead>
           <tbody id="ruleRows"></tbody>
         </table>
         <div id="rulesPagination" class="pagination hidden"></div>
+      </div>
+    </section>
+
+    <!-- Slow Queries Tab -->
+    <section id="slowQueries" class="hidden">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <div class="search-box">
+            <input id="sqSearch" type="text" placeholder="Search by destination or outbound..." oninput="renderSlowQueries()">
+          </div>
+        </div>
+        <div class="toolbar-right">
+          <button onclick="refreshSlowQueries()">Refresh</button>
+          <button class="danger" onclick="clearSlowQueries()">Clear All</button>
+        </div>
+      </div>
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th>Destination</th>
+              <th>Outbound</th>
+              <th>Elapsed</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="sqRows"></tbody>
+        </table>
+        <div id="sqPagination" class="pagination hidden"></div>
       </div>
     </section>
   </main>
@@ -463,13 +492,15 @@
     let outbounds = [];
     let observations = [];
     let rules = [];
+    let slowQueries = [];
     let editingId = null;
     let activeTypeFilter = null;
 
     // Pagination state
     const PAGE_SIZES = [20, 50, 100];
-    let obsPage = 1, obsPageSize = 50;
-    let rulesPage = 1, rulesPageSize = 50;
+    let obsPage = 1, obsPageSize = 20;
+    let rulesPage = 1, rulesPageSize = 20;
+    let sqPage = 1, sqPageSize = 20;
 
     const placeholders = {
       exact: "example.com or 1.1.1.1",
@@ -500,8 +531,11 @@
     function showTab(tab) {
       document.getElementById("observations").classList.toggle("hidden", tab !== "observations");
       document.getElementById("rules").classList.toggle("hidden", tab !== "rules");
+      document.getElementById("slowQueries").classList.toggle("hidden", tab !== "slowQueries");
       document.getElementById("tabObservations").classList.toggle("active", tab === "observations");
       document.getElementById("tabRules").classList.toggle("active", tab === "rules");
+      document.getElementById("tabSlowQueries").classList.toggle("active", tab === "slowQueries");
+      if (tab === "slowQueries") refreshSlowQueries();
     }
 
     async function refresh() {
@@ -522,6 +556,7 @@
     function updateCounts() {
       const obsEl = document.getElementById("obsCount");
       const rulesEl = document.getElementById("rulesCount");
+      const sqEl = document.getElementById("sqCount");
       if (observations.length > 0) {
         obsEl.textContent = observations.length;
         obsEl.classList.remove("hidden");
@@ -533,6 +568,12 @@
         rulesEl.classList.remove("hidden");
       } else {
         rulesEl.classList.add("hidden");
+      }
+      if (slowQueries.length > 0) {
+        sqEl.textContent = slowQueries.length;
+        sqEl.classList.remove("hidden");
+      } else {
+        sqEl.classList.add("hidden");
       }
     }
 
@@ -642,10 +683,7 @@
             </td>
             <td><span class="badge badge-outbound">${esc(rule.outbound)}</span></td>
             <td><span class="badge badge-priority">${rule.priority}</span></td>
-            <td><div class="actions">
-              <button onclick="editRule('${escAttr(rule.id)}')">Edit</button>
-              <button class="danger" onclick="removeRule('${escAttr(rule.id)}')">Del</button>
-            </div></td>
+            <td><div class="actions"><button class="sm" onclick="editRule('${escAttr(rule.id)}')">Edit</button><button class="sm danger" onclick="removeRule('${escAttr(rule.id)}')">Del</button></div></td>
           </tr>
         `).join("");
       }
@@ -665,7 +703,7 @@
       }
       container.classList.remove("hidden");
 
-      const info = `Showing ${Math.min((currentPage - 1) * pageSize + 1, total)}–${Math.min(currentPage * pageSize, total)} of ${total}`;
+      const info = `Showing ${Math.min((currentPage - 1) * pageSize + 1, total)}\u2013${Math.min(currentPage * pageSize, total)} of ${total}`;
 
       let pages = "";
       const maxVisible = 5;
@@ -778,6 +816,62 @@
       }
     }
 
+    // --- Slow Queries ---
+
+    async function refreshSlowQueries() {
+      try {
+        const res = await fetch("/slow-queries");
+        slowQueries = await res.json();
+        renderSlowQueries();
+        updateCounts();
+      } catch (err) {
+        toast(err.message);
+      }
+    }
+
+    async function clearSlowQueries() {
+      await fetch("/slow-queries", { method: "DELETE" });
+      slowQueries = [];
+      renderSlowQueries();
+      updateCounts();
+      toast("Slow queries cleared");
+    }
+
+    function getFilteredSlowQueries() {
+      const q = (document.getElementById("sqSearch")?.value || "").toLowerCase().trim();
+      if (!q) return slowQueries;
+      return slowQueries.filter(sq =>
+        sq.destination.toLowerCase().includes(q) ||
+        sq.outbound.toLowerCase().includes(q)
+      );
+    }
+
+    function renderSlowQueries() {
+      const filtered = getFilteredSlowQueries();
+      const total = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(total / sqPageSize));
+      if (sqPage > totalPages) sqPage = totalPages;
+
+      const start = (sqPage - 1) * sqPageSize;
+      const page = filtered.slice(start, start + sqPageSize);
+
+      if (page.length === 0) {
+        document.getElementById("sqRows").innerHTML =
+          `<tr><td colspan="4"><div class="empty-state"><div class="empty-state-icon">&#9889;</div><div class="empty-state-text">No slow queries${filtered.length !== slowQueries.length ? ' matching filter' : ''}</div></div></td></tr>`;
+      } else {
+        document.getElementById("sqRows").innerHTML = page.map(sq => `
+          <tr>
+            <td style="font-family:monospace;font-size:12px;word-break:break-all">${esc(sq.destination)}</td>
+            <td><span class="badge badge-outbound">${esc(sq.outbound)}</span></td>
+            <td><span style="color:${sq.elapsed_us > 1000 ? 'var(--danger)' : sq.elapsed_us > 500 ? 'var(--warning)' : 'var(--text)'};font-weight:600">${sq.elapsed_us.toFixed(1)}\u00b5s</span></td>
+            <td class="muted">${esc(sq.timestamp)}</td>
+          </tr>
+        `).join("");
+      }
+
+      renderPagination("sqPagination", total, sqPage, sqPageSize, (p, ps) => { sqPage = p; sqPageSize = ps; renderSlowQueries(); });
+    }
+
     // --- Actions ---
 
     function editRule(id) {
@@ -791,7 +885,7 @@
           method: "POST",
           body: JSON.stringify({ destination, outbound })
         });
-        toast(`Added ${destination} → ${outbound}`);
+        toast(`Added ${destination} \u2192 ${outbound}`);
         await refresh();
       } catch (err) {
         toast(err.message);
