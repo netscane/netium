@@ -188,12 +188,17 @@ async fn read_address(stream: &mut Stream, atyp: u8) -> Result<Address> {
             stream.read_exact(&mut domain).await?;
             let port = read_port(stream).await?;
             let domain = String::from_utf8_lossy(&domain).to_string();
-            // Normalize: if domain is actually an IP literal, use Socket variant
-            if let Ok(ip) = domain.parse::<IpAddr>() {
-                Ok(Address::Socket(SocketAddr::new(ip, port)))
-            } else {
-                Ok(Address::Domain(domain, port))
+            // Normalize: if domain is actually an IP literal, use Socket variant.
+            // Quick pre-check to avoid parse cost on real domains:
+            // IPv4 contains only digits and dots; IPv6 contains hex digits and colons.
+            let looks_like_ip = domain.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                || domain.bytes().all(|b| b.is_ascii_hexdigit() || b == b':');
+            if looks_like_ip {
+                if let Ok(ip) = domain.parse::<IpAddr>() {
+                    return Ok(Address::Socket(SocketAddr::new(ip, port)));
+                }
             }
+            Ok(Address::Domain(domain, port))
         }
         ATYP_IPV6 => {
             let mut addr = [0u8; 16];

@@ -7,167 +7,371 @@
   <style>
     :root {
       color-scheme: light;
-      --bg: #f7f8fa;
+      --bg: #f4f6f9;
       --panel: #ffffff;
-      --line: #d8dde5;
-      --text: #17202a;
-      --muted: #637083;
-      --accent: #176b87;
-      --accent-soft: #e6f3f6;
-      --danger: #b42318;
+      --line: #e2e6ed;
+      --text: #1a2332;
+      --muted: #6b7a8d;
+      --accent: #1a73a7;
+      --accent-hover: #145d87;
+      --accent-soft: #e8f4fa;
+      --danger: #c0392b;
+      --danger-soft: #fdecea;
+      --success: #27ae60;
+      --success-soft: #e8f8f0;
+      --warning: #f39c12;
+      --radius: 8px;
+      --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+      --shadow-md: 0 4px 16px rgba(0,0,0,0.1);
+      --transition: 180ms ease;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
       background: var(--bg);
       color: var(--text);
+      line-height: 1.5;
     }
     header {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      padding: 18px 24px;
+      padding: 16px 24px;
       border-bottom: 1px solid var(--line);
       background: var(--panel);
+      box-shadow: var(--shadow-sm);
+      position: sticky;
+      top: 0;
+      z-index: 30;
     }
-    h1 { margin: 0; font-size: 20px; font-weight: 700; }
-    main { max-width: 1180px; margin: 0 auto; padding: 22px; }
-    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+    .header-actions { display: flex; gap: 8px; align-items: center; }
+    main { max-width: 1200px; margin: 0 auto; padding: 20px 24px; }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 4px; margin-bottom: 18px; background: var(--panel); border-radius: var(--radius); padding: 4px; border: 1px solid var(--line); width: fit-content; }
+    .tab {
+      height: 32px;
+      padding: 0 16px;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+    .tab:hover { color: var(--text); background: var(--bg); }
+    .tab.active { background: var(--accent); color: white; box-shadow: 0 1px 4px rgba(26,115,167,0.3); }
+
+    /* Buttons */
     button, select, input {
       font: inherit;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: #fff;
       color: var(--text);
+      transition: all var(--transition);
     }
     button {
       height: 34px;
-      padding: 0 12px;
+      padding: 0 14px;
       cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
     }
+    button:hover { border-color: #bcc4d0; background: #f8f9fb; }
+    button:active { transform: scale(0.97); }
     button.primary { background: var(--accent); border-color: var(--accent); color: white; }
-    button.tab.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
-    button.danger { color: var(--danger); }
-    .toolbar { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; align-items: center; }
+    button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    button.danger { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+    button.danger:hover { background: var(--danger); color: white; }
+
+    /* Search */
+    .search-box {
+      position: relative;
+      flex: 1;
+      max-width: 320px;
+    }
+    .search-box input {
+      width: 100%;
+      height: 34px;
+      padding: 0 12px 0 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-size: 13px;
+      background: var(--bg);
+    }
+    .search-box input:focus { outline: none; border-color: var(--accent); background: white; box-shadow: 0 0 0 3px rgba(26,115,167,0.1); }
+    .search-box::before {
+      content: "";
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 14px;
+      height: 14px;
+      background: var(--muted);
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E") center/contain no-repeat;
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E") center/contain no-repeat;
+    }
+
+    /* Toolbar */
+    .toolbar { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+    .toolbar-left { display: flex; gap: 10px; align-items: center; flex: 1; }
+    .toolbar-right { display: flex; gap: 8px; align-items: center; }
+
+    /* Panel */
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: var(--radius);
       overflow: hidden;
+      box-shadow: var(--shadow-sm);
     }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; font-size: 14px; }
-    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; background: #fbfcfd; }
-    tr:last-child td { border-bottom: 0; }
-    .actions { display: flex; flex-wrap: wrap; gap: 6px; }
-    .muted { color: var(--muted); }
 
-    .form-section {
-      padding: 14px;
-      border-bottom: 1px solid var(--line);
-      background: #fbfcfd;
+    /* Table */
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 14px; border-bottom: 1px solid var(--line); text-align: left; font-size: 13px; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; background: #fafbfc; position: sticky; top: 0; }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr { transition: background var(--transition); }
+    tbody tr:hover { background: #f8fafc; }
+
+    /* Badges */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
     }
+    .badge-type { background: var(--accent-soft); color: var(--accent); }
+    .badge-outbound { background: #f0e6ff; color: #6b21a8; }
+    .badge-priority { background: #fff7ed; color: #c2410c; }
+
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .copy-btn {
+      visibility: hidden;
+      font-size: 10px;
+      height: 20px;
+      padding: 0 6px;
+      margin-left: 4px;
+      cursor: pointer;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #f0f2f5;
+      color: var(--muted);
+    }
+    tr:hover .copy-btn { visibility: visible; }
+    th .copy-btn { visibility: visible; }
+
+    /* Toggle switch */
+    .toggle { position: relative; display: inline-block; width: 36px; height: 20px; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #ccd3dc;
+      border-radius: 10px;
+      transition: var(--transition);
+    }
+    .toggle .slider::before {
+      content: "";
+      position: absolute;
+      height: 14px;
+      width: 14px;
+      left: 3px;
+      bottom: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: var(--transition);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+    }
+    .toggle input:checked + .slider { background: var(--success); }
+    .toggle input:checked + .slider::before { transform: translateX(16px); }
+
+    /* Pagination */
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-top: 1px solid var(--line);
+      background: #fafbfc;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .pagination-controls { display: flex; gap: 4px; align-items: center; }
+    .pagination button {
+      height: 28px;
+      min-width: 28px;
+      padding: 0 8px;
+      font-size: 12px;
+      border-radius: 4px;
+    }
+    .pagination button.active { background: var(--accent); color: white; border-color: var(--accent); }
+    .pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .page-size-select { height: 28px; padding: 0 6px; font-size: 12px; border-radius: 4px; }
+
+    /* Empty state */
+    .empty-state {
+      padding: 48px 20px;
+      text-align: center;
+      color: var(--muted);
+    }
+    .empty-state-icon { font-size: 36px; margin-bottom: 12px; opacity: 0.5; }
+    .empty-state-text { font-size: 14px; }
+
+    /* Filter chips */
+    .filter-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      height: 26px;
+      padding: 0 10px;
+      border-radius: 13px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid var(--line);
+      background: white;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+    .chip:hover { border-color: var(--accent); color: var(--accent); }
+    .chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 200ms, visibility 200ms;
+    }
+    .modal-overlay.show { opacity: 1; visibility: visible; }
+    .modal {
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 24px;
+      width: 90vw;
+      max-width: 540px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+      transform: translateY(10px) scale(0.98);
+      transition: transform 200ms ease;
+    }
+    .modal-overlay.show .modal { transform: translateY(0) scale(1); }
+    .modal h3 { margin: 0 0 18px 0; font-size: 17px; font-weight: 700; }
     .form-grid {
       display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
-      gap: 10px;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
     }
-    .form-grid label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
-    .form-grid input, .form-grid select { height: 34px; padding: 0 9px; min-width: 0; }
+    .form-grid label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); font-weight: 500; }
+    .form-grid input, .form-grid select { height: 36px; padding: 0 10px; min-width: 0; font-size: 13px; }
+    .form-grid input:focus, .form-grid select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(26,115,167,0.1); }
     .span2 { grid-column: span 2; }
-    .span3 { grid-column: span 3; }
-    .span4 { grid-column: span 4; }
-    .span6 { grid-column: span 6; }
 
     .match-type-group {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px;
+      gap: 4px;
       align-items: center;
     }
     .match-type-group label {
       display: flex;
       align-items: center;
-      gap: 3px;
-      font-size: 13px;
+      gap: 4px;
+      font-size: 12px;
       cursor: pointer;
-      padding: 2px 0;
+      padding: 4px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--line);
+      transition: all var(--transition);
     }
-    .match-type-group input[type="radio"] { margin: 0; }
+    .match-type-group label:has(input:checked) { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+    .match-type-group input[type="radio"] { display: none; }
 
+    .modal-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+
+    /* Count badge */
+    .count { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 600; margin-left: 6px; }
+
+    /* Toast */
     .toast {
       position: fixed;
-      right: 18px;
-      bottom: 18px;
-      padding: 10px 12px;
-      background: #17202a;
+      right: 20px;
+      bottom: 20px;
+      padding: 10px 16px;
+      background: var(--text);
       color: white;
-      border-radius: 6px;
+      border-radius: 8px;
+      font-size: 13px;
       opacity: 0;
       transform: translateY(8px);
-      transition: 160ms ease;
+      transition: 200ms ease;
       pointer-events: none;
       z-index: 100;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
     }
     .toast.show { opacity: 1; transform: translateY(0); }
-
-    .modal-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.4);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 50;
-    }
-    .modal {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 20px 24px;
-      width: 90vw;
-      max-width: 540px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.15);
-    }
-    .modal h3 { margin: 0 0 16px 0; font-size: 17px; }
-    .modal .form-grid { grid-template-columns: 1fr 1fr; }
-    .modal .form-grid .span2 { grid-column: span 2; }
-    .modal-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 
     @media (max-width: 760px) {
       main { padding: 14px; }
       .form-grid { grid-template-columns: 1fr; }
-      .span2, .span3, .span4, .span6 { grid-column: span 1; }
-      th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4) { display: none; }
-      .modal .form-grid { grid-template-columns: 1fr; }
-      .modal .form-grid .span2 { grid-column: span 1; }
+      .span2 { grid-column: span 1; }
+      th:nth-child(5), td:nth-child(5) { display: none; }
+      .search-box { max-width: 100%; }
+      .toolbar { flex-direction: column; align-items: stretch; }
+      .toolbar-left, .toolbar-right { width: 100%; }
     }
-    .hidden { display: none; }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
   <header>
     <h1>Netium Routes</h1>
-    <button onclick="refresh()">Refresh</button>
+    <div class="header-actions">
+      <button onclick="refresh()">Refresh</button>
+    </div>
   </header>
   <main>
     <div class="tabs">
-      <button id="tabObservations" class="tab active" onclick="showTab('observations')">Observations</button>
-      <button id="tabRules" class="tab" onclick="showTab('rules')">Manual Rules</button>
+      <button id="tabObservations" class="tab active" onclick="showTab('observations')">Observations<span id="obsCount" class="count hidden">0</span></button>
+      <button id="tabRules" class="tab" onclick="showTab('rules')">Rules<span id="rulesCount" class="count hidden">0</span></button>
     </div>
 
+    <!-- Observations Tab -->
     <section id="observations">
       <div class="toolbar">
-        <div class="muted">Destinations recorded by rules with record_destination enabled. Filtered to show only those without existing dynamic rules.</div>
-        <button class="danger" onclick="clearObservations()">Clear All</button>
+        <div class="toolbar-left">
+          <div class="search-box">
+            <input id="obsSearch" type="text" placeholder="Search destinations..." oninput="renderObservations()">
+          </div>
+        </div>
+        <div class="toolbar-right">
+          <button class="danger" onclick="clearObservations()">Clear All</button>
+        </div>
       </div>
       <div class="panel">
         <table>
           <thead>
             <tr>
-              <th>Destination</th>
+              <th>Destination <button class="copy-btn" onclick="copyAllDests()" title="Copy all">Copy All</button></th>
               <th>Hits</th>
               <th>Last Seen</th>
               <th>Set Outbound</th>
@@ -175,13 +379,20 @@
           </thead>
           <tbody id="observationRows"></tbody>
         </table>
+        <div id="obsPagination" class="pagination hidden"></div>
       </div>
     </section>
 
+    <!-- Rules Tab -->
     <section id="rules" class="hidden">
       <div class="toolbar">
-        <div class="muted">Rules are persisted to dynamic_routes.json and take effect immediately.</div>
-        <div class="actions">
+        <div class="toolbar-left">
+          <div class="search-box">
+            <input id="ruleSearch" type="text" placeholder="Search rules by pattern, comment..." oninput="renderRules()">
+          </div>
+          <div class="filter-chips" id="typeFilters"></div>
+        </div>
+        <div class="toolbar-right">
           <button class="primary" onclick="openAddModal()">+ Add Rule</button>
           <button onclick="reloadRules()">Reload</button>
         </div>
@@ -190,25 +401,27 @@
         <table>
           <thead>
             <tr>
-              <th>Enabled</th>
-              <th>Match</th>
+              <th style="width:50px">On</th>
+              <th>Type</th>
               <th>Pattern</th>
               <th>Outbound</th>
               <th>Priority</th>
-              <th>Actions</th>
+              <th style="width:120px">Actions</th>
             </tr>
           </thead>
           <tbody id="ruleRows"></tbody>
         </table>
+        <div id="rulesPagination" class="pagination hidden"></div>
       </div>
     </section>
   </main>
 
-  <div id="modalOverlay" class="modal-overlay hidden" onclick="closeModal()">
+  <!-- Modal -->
+  <div id="modalOverlay" class="modal-overlay" onclick="closeModal()">
     <div class="modal" onclick="event.stopPropagation()">
       <h3 id="modalTitle">Add Rule</h3>
       <div class="form-grid">
-        <div class="span2 match-type-group" style="align-self:center">
+        <div class="span2 match-type-group">
           <label><input type="radio" name="matchType" value="exact" onchange="updatePlaceholder()"> Exact</label>
           <label><input type="radio" name="matchType" value="domain" checked onchange="updatePlaceholder()"> Domain</label>
           <label><input type="radio" name="matchType" value="wildcard" onchange="updatePlaceholder()"> Wildcard</label>
@@ -232,9 +445,9 @@
           Priority
           <input id="modalPriority" type="number" value="100" min="0">
         </label>
-        <label class="span2">
+        <label>
           Comment
-          <input id="modalComment" placeholder="optional">
+          <input id="modalComment" placeholder="optional note">
         </label>
       </div>
       <div class="modal-footer">
@@ -251,6 +464,12 @@
     let observations = [];
     let rules = [];
     let editingId = null;
+    let activeTypeFilter = null;
+
+    // Pagination state
+    const PAGE_SIZES = [20, 50, 100];
+    let obsPage = 1, obsPageSize = 50;
+    let rulesPage = 1, rulesPageSize = 50;
 
     const placeholders = {
       exact: "example.com or 1.1.1.1",
@@ -275,7 +494,7 @@
       const el = document.getElementById("toast");
       el.textContent = message;
       el.classList.add("show");
-      setTimeout(() => el.classList.remove("show"), 1800);
+      setTimeout(() => el.classList.remove("show"), 2000);
     }
 
     function showTab(tab) {
@@ -286,21 +505,202 @@
     }
 
     async function refresh() {
-      outbounds = await api("/api/outbounds");
-      observations = await api("/api/observations");
-      rules = await api("/api/rules").catch(() => []);
-      renderOutboundSelects();
-      renderObservations();
-      renderRules();
+      try {
+        outbounds = await api("/api/outbounds");
+        observations = await api("/api/observations");
+        rules = await api("/api/rules").catch(() => []);
+        renderOutboundSelects();
+        renderTypeFilters();
+        renderObservations();
+        renderRules();
+        updateCounts();
+      } catch (err) {
+        toast(err.message);
+      }
+    }
+
+    function updateCounts() {
+      const obsEl = document.getElementById("obsCount");
+      const rulesEl = document.getElementById("rulesCount");
+      if (observations.length > 0) {
+        obsEl.textContent = observations.length;
+        obsEl.classList.remove("hidden");
+      } else {
+        obsEl.classList.add("hidden");
+      }
+      if (rules.length > 0) {
+        rulesEl.textContent = rules.length;
+        rulesEl.classList.remove("hidden");
+      } else {
+        rulesEl.classList.add("hidden");
+      }
     }
 
     function renderOutboundSelects() {
       const html = outbounds
-        .map(tag => `<option value="${escapeHtml(tag)}">${escapeHtml(tag)}</option>`)
+        .map(tag => `<option value="${esc(tag)}">${esc(tag)}</option>`)
         .join("");
       const el = document.getElementById("modalOutbound");
       if (el) el.innerHTML = html;
     }
+
+    function renderTypeFilters() {
+      const types = [...new Set(rules.map(r => r.match_type))].sort();
+      const container = document.getElementById("typeFilters");
+      container.innerHTML = types.map(t =>
+        `<span class="chip ${activeTypeFilter === t ? 'active' : ''}" onclick="toggleTypeFilter('${esc(t)}')">${esc(t)}</span>`
+      ).join("");
+    }
+
+    function toggleTypeFilter(type) {
+      activeTypeFilter = activeTypeFilter === type ? null : type;
+      rulesPage = 1;
+      renderTypeFilters();
+      renderRules();
+    }
+
+    // --- Observations ---
+
+    function getFilteredObservations() {
+      const q = (document.getElementById("obsSearch")?.value || "").toLowerCase().trim();
+      if (!q) return observations;
+      return observations.filter(o => o.destination.toLowerCase().includes(q));
+    }
+
+    function renderObservations() {
+      const filtered = getFilteredObservations();
+      const total = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(total / obsPageSize));
+      if (obsPage > totalPages) obsPage = totalPages;
+
+      const start = (obsPage - 1) * obsPageSize;
+      const page = filtered.slice(start, start + obsPageSize);
+
+      if (page.length === 0) {
+        document.getElementById("observationRows").innerHTML =
+          `<tr><td colspan="4"><div class="empty-state"><div class="empty-state-icon">&#128065;</div><div class="empty-state-text">No observations${filtered.length !== observations.length ? ' matching filter' : ''}</div></div></td></tr>`;
+      } else {
+        document.getElementById("observationRows").innerHTML = page.map(item => `
+          <tr>
+            <td>${esc(item.destination)}<button class="copy-btn" onclick="event.stopPropagation();copyText('${escAttr(item.destination)}')" title="Copy">Copy</button></td>
+            <td>${item.hits}</td>
+            <td>${esc(item.last_seen)}</td>
+            <td><div class="actions">${outbounds.map(tag =>
+              `<button onclick="createFromObservation('${escAttr(item.destination)}','${escAttr(tag)}')">${esc(tag)}</button>`
+            ).join("")}</div></td>
+          </tr>
+        `).join("");
+      }
+
+      renderPagination("obsPagination", total, obsPage, obsPageSize, (p, ps) => { obsPage = p; obsPageSize = ps; renderObservations(); });
+    }
+
+    // --- Rules ---
+
+    function getFilteredRules() {
+      let filtered = rules;
+      const q = (document.getElementById("ruleSearch")?.value || "").toLowerCase().trim();
+      if (q) {
+        filtered = filtered.filter(r =>
+          r.pattern.toLowerCase().includes(q) ||
+          (r.comment || "").toLowerCase().includes(q) ||
+          r.outbound.toLowerCase().includes(q) ||
+          r.match_type.toLowerCase().includes(q)
+        );
+      }
+      if (activeTypeFilter) {
+        filtered = filtered.filter(r => r.match_type === activeTypeFilter);
+      }
+      return filtered;
+    }
+
+    function renderRules() {
+      const filtered = getFilteredRules();
+      const total = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(total / rulesPageSize));
+      if (rulesPage > totalPages) rulesPage = totalPages;
+
+      const start = (rulesPage - 1) * rulesPageSize;
+      const page = filtered.slice(start, start + rulesPageSize);
+
+      if (page.length === 0) {
+        document.getElementById("ruleRows").innerHTML =
+          `<tr><td colspan="6"><div class="empty-state"><div class="empty-state-icon">&#128220;</div><div class="empty-state-text">No rules${filtered.length !== rules.length ? ' matching filter' : '. Click "+ Add Rule" to create one.'}</div></div></td></tr>`;
+      } else {
+        document.getElementById("ruleRows").innerHTML = page.map(rule => `
+          <tr style="opacity:${rule.enabled ? 1 : 0.5}">
+            <td>
+              <label class="toggle">
+                <input type="checkbox" ${rule.enabled ? "checked" : ""} onchange="setEnabled('${escAttr(rule.id)}', this.checked)">
+                <span class="slider"></span>
+              </label>
+            </td>
+            <td><span class="badge badge-type">${esc(rule.match_type)}</span>${rule.port ? `<span style="margin-left:4px;font-size:11px;color:var(--muted)">:${rule.port}</span>` : ""}</td>
+            <td>
+              <div style="font-family:monospace;font-size:12px;word-break:break-all">${esc(rule.pattern)}</div>
+              ${rule.comment ? `<div class="muted" style="font-size:11px;margin-top:2px">${esc(rule.comment)}</div>` : ""}
+            </td>
+            <td><span class="badge badge-outbound">${esc(rule.outbound)}</span></td>
+            <td><span class="badge badge-priority">${rule.priority}</span></td>
+            <td><div class="actions">
+              <button onclick="editRule('${escAttr(rule.id)}')">Edit</button>
+              <button class="danger" onclick="removeRule('${escAttr(rule.id)}')">Del</button>
+            </div></td>
+          </tr>
+        `).join("");
+      }
+
+      renderPagination("rulesPagination", total, rulesPage, rulesPageSize, (p, ps) => { rulesPage = p; rulesPageSize = ps; renderRules(); });
+    }
+
+    // --- Pagination ---
+
+    function renderPagination(containerId, total, currentPage, pageSize, onChange) {
+      const container = document.getElementById(containerId);
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+      if (total <= PAGE_SIZES[0]) {
+        container.classList.add("hidden");
+        return;
+      }
+      container.classList.remove("hidden");
+
+      const info = `Showing ${Math.min((currentPage - 1) * pageSize + 1, total)}–${Math.min(currentPage * pageSize, total)} of ${total}`;
+
+      let pages = "";
+      const maxVisible = 5;
+      let startPage = Math.max(1, currentPage - Math.floor(maxVisible / 2));
+      let endPage = Math.min(totalPages, startPage + maxVisible - 1);
+      if (endPage - startPage < maxVisible - 1) startPage = Math.max(1, endPage - maxVisible + 1);
+
+      pages += `<button ${currentPage <= 1 ? 'disabled' : ''} onclick="this.blur()">&#8249;</button>`;
+      for (let i = startPage; i <= endPage; i++) {
+        pages += `<button class="${i === currentPage ? 'active' : ''}" onclick="this.blur()">${i}</button>`;
+      }
+      pages += `<button ${currentPage >= totalPages ? 'disabled' : ''} onclick="this.blur()">&#8250;</button>`;
+
+      const sizeOptions = PAGE_SIZES.map(s => `<option value="${s}" ${s === pageSize ? 'selected' : ''}>${s}/page</option>`).join("");
+
+      container.innerHTML = `
+        <span>${info}</span>
+        <div class="pagination-controls">${pages}<select class="page-size-select">${sizeOptions}</select></div>
+      `;
+
+      // Bind events
+      const buttons = container.querySelectorAll(".pagination-controls button");
+      buttons[0].onclick = () => { if (currentPage > 1) onChange(currentPage - 1, pageSize); };
+      for (let i = 1; i < buttons.length - 1; i++) {
+        const pageNum = startPage + i - 1;
+        buttons[i].onclick = () => onChange(pageNum, pageSize);
+      }
+      buttons[buttons.length - 1].onclick = () => { if (currentPage < totalPages) onChange(currentPage + 1, pageSize); };
+
+      container.querySelector(".page-size-select").onchange = function () {
+        onChange(1, Number(this.value));
+      };
+    }
+
+    // --- Modal ---
 
     function updatePlaceholder() {
       const type = document.querySelector('input[name="matchType"]:checked')?.value || "domain";
@@ -317,7 +717,7 @@
       document.getElementById("modalPriority").value = "100";
       document.getElementById("modalComment").value = "";
       updatePlaceholder();
-      document.getElementById("modalOverlay").classList.remove("hidden");
+      document.getElementById("modalOverlay").classList.add("show");
     }
 
     function openEditModal(rule) {
@@ -331,24 +731,20 @@
       document.getElementById("modalPriority").value = rule.priority;
       document.getElementById("modalComment").value = rule.comment || "";
       updatePlaceholder();
-      document.getElementById("modalOverlay").classList.remove("hidden");
+      document.getElementById("modalOverlay").classList.add("show");
     }
 
     function closeModal() {
-      document.getElementById("modalOverlay").classList.add("hidden");
+      document.getElementById("modalOverlay").classList.remove("show");
       editingId = null;
     }
 
     function setRadio(name, value) {
-      const radios = document.querySelectorAll(`input[name="${name}"]`);
-      for (const r of radios) {
-        r.checked = r.value === value;
-      }
+      for (const r of document.querySelectorAll(`input[name="${name}"]`)) r.checked = r.value === value;
     }
 
     function getRadio(name) {
-      const el = document.querySelector(`input[name="${name}"]:checked`);
-      return el ? el.value : "domain";
+      return document.querySelector(`input[name="${name}"]:checked`)?.value || "domain";
     }
 
     async function saveRule() {
@@ -365,28 +761,13 @@
         if (editingId) {
           await api("/api/rules/edit", {
             method: "POST",
-            body: JSON.stringify({
-              id: editingId,
-              match_type: matchType,
-              pattern,
-              port: portValue ? Number(portValue) : null,
-              outbound,
-              priority,
-              comment
-            })
+            body: JSON.stringify({ id: editingId, match_type: matchType, pattern, port: portValue ? Number(portValue) : null, outbound, priority, comment })
           });
           toast("Rule updated");
         } else {
           await api("/api/rules/add", {
             method: "POST",
-            body: JSON.stringify({
-              match_type: matchType,
-              pattern,
-              port: portValue ? Number(portValue) : null,
-              outbound,
-              priority,
-              comment
-            })
+            body: JSON.stringify({ match_type: matchType, pattern, port: portValue ? Number(portValue) : null, outbound, priority, comment })
           });
           toast("Rule added");
         }
@@ -397,36 +778,7 @@
       }
     }
 
-    function renderObservations() {
-      const rows = observations.map(item => `
-        <tr>
-          <td>${escapeHtml(item.destination)}</td>
-          <td>${item.hits}</td>
-          <td>${escapeHtml(item.last_seen)}</td>
-          <td><div class="actions">${outbounds.map(tag =>
-            `<button onclick="createFromObservation('${escapeAttr(item.destination)}','${escapeAttr(tag)}')">${escapeHtml(tag)}</button>`
-          ).join("")}</div></td>
-        </tr>
-      `).join("");
-      document.getElementById("observationRows").innerHTML = rows || `<tr><td colspan="4" class="muted">No observations</td></tr>`;
-    }
-
-    function renderRules() {
-      const rows = rules.map(rule => `
-        <tr>
-          <td><input type="checkbox" ${rule.enabled ? "checked" : ""} onchange="setEnabled('${escapeAttr(rule.id)}', this.checked)"></td>
-          <td>${escapeHtml(rule.match_type)}${rule.port ? ":" + rule.port : ""}</td>
-          <td>${escapeHtml(rule.pattern)}<div class="muted">${escapeHtml(rule.comment || "")}</div></td>
-          <td>${escapeHtml(rule.outbound)}</td>
-          <td>${rule.priority}</td>
-          <td><div class="actions">
-            <button onclick="editRule('${escapeAttr(rule.id)}')">Edit</button>
-            <button class="danger" onclick="removeRule('${escapeAttr(rule.id)}')">Delete</button>
-          </div></td>
-        </tr>
-      `).join("");
-      document.getElementById("ruleRows").innerHTML = rows || `<tr><td colspan="6" class="muted">No dynamic rules</td></tr>`;
-    }
+    // --- Actions ---
 
     function editRule(id) {
       const rule = rules.find(r => r.id === id);
@@ -470,13 +822,41 @@
       await refresh();
     }
 
-    function escapeHtml(value) {
+    // --- Utils ---
+
+    function esc(value) {
       return String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
-
-    function escapeAttr(value) {
-      return escapeHtml(value).replace(/\\/g, "\\\\");
+    function escAttr(value) {
+      return esc(value).replace(/\\/g, "\\\\");
     }
+
+    function copyText(text) {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(() => toast("Copied"), () => toast("Copy failed"));
+        return;
+      }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      toast("Copied");
+    }
+
+    function copyAllDests() {
+      const filtered = getFilteredObservations();
+      const text = filtered.map(o => o.destination).join("\n");
+      if (!text) { toast("Nothing to copy"); return; }
+      copyText(text);
+    }
+
+    // Keyboard shortcuts
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape") closeModal();
+    });
 
     refresh().catch(err => toast(err.message));
   </script>

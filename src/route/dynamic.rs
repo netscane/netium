@@ -135,24 +135,24 @@ impl CompiledDynamic {
     fn from_items(items: &[DynamicRule]) -> Self {
         let enabled: Vec<&DynamicRule> = items.iter().filter(|r| r.enabled).collect();
 
-        // Group items by outbound tag
-        let mut by_outbound: HashMap<&str, Vec<&DynamicRule>> = HashMap::new();
+        // Group items by (outbound, port) — rules with different port constraints
+        // must NOT be merged into the same group.
+        let mut by_key: HashMap<(&str, Option<u16>), Vec<&DynamicRule>> = HashMap::new();
         for item in &enabled {
-            by_outbound
-                .entry(item.outbound.as_str())
+            by_key
+                .entry((item.outbound.as_str(), item.port))
                 .or_default()
                 .push(item);
         }
 
-        // For each outbound group, build compiled matchers
-        let mut groups: Vec<CompiledGroup> = by_outbound
+        // For each group, build compiled matchers
+        let mut groups: Vec<CompiledGroup> = by_key
             .into_iter()
-            .map(|(outbound, rules)| {
+            .map(|((outbound, port), rules)| {
                 let max_priority = rules.iter().map(|r| r.priority).max().unwrap_or(100);
 
                 let mut domain_builder = DomainMatcherBuilder::new();
                 let mut ip_builder = IpMatcherBuilder::new();
-                let port = rules.iter().find_map(|r| r.port);
 
                 for rule in &rules {
                     match rule.match_type {
@@ -596,6 +596,91 @@ mod tests {
         assert_eq!(
             mgr.match_outbound(&Metadata::new(Address::domain("example.com", 443))),
             Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn cidr_matches_ip_on_any_port() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Simulate the bug scenario: a domain rule with port=443 and a CIDR rule
+        // with port=None on the same outbound. The CIDR rule must still match
+        // IP requests on port 80.
+        let mgr = unseeded_manager(vec![
+            DynamicRule {
+                id: "1".to_string(),
+                enabled: true,
+                match_type: DynamicRuleMatchType::Domain,
+                pattern: "t.me".to_string(),
+                port: Some(443),
+                outbound: "proxy".to_string(),
+                priority: 100,
+                comment: String::new(),
+                created_at: 0,
+                updated_at: 0,
+            },
+            DynamicRule {
+                id: "2".to_string(),
+                enabled: true,
+                match_type: DynamicRuleMatchType::Cidr,
+                pattern: "149.154.160.0/20".to_string(),
+                port: None,
+                outbound: "proxy".to_string(),
+                priority: 100,
+                comment: String::new(),
+                created_at: 0,
+                updated_at: 0,
+            },
+            DynamicRule {
+                id: "3".to_string(),
+                enabled: true,
+                match_type: DynamicRuleMatchType::Cidr,
+                pattern: "91.108.56.0/22".to_string(),
+                port: None,
+                outbound: "proxy".to_string(),
+                priority: 100,
+                comment: String::new(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        ]);
+
+        // IP requests on port 80 must match CIDR rules
+        let test_cases: &[(&str, u16, bool)] = &[
+            ("91.108.56.166", 80, true),
+            ("149.154.175.55", 80, true),
+            ("149.154.167.41", 80, true),
+            ("149.154.167.91", 80, true),
+            // Also works on port 443
+            ("149.154.167.91", 443, true),
+            // Outside CIDR range
+            ("8.8.8.8", 80, false),
+        ];
+
+        for &(ip_str, port, expect_match) in test_cases {
+            let ip: IpAddr = ip_str.parse().unwrap();
+            let addr = Address::Socket(SocketAddr::new(ip, port));
+            let result = mgr.match_outbound(&Metadata::new(addr));
+            assert_eq!(
+                result.is_some(),
+                expect_match,
+                "{}:{} expected match={}, got {:?}",
+                ip_str,
+                port,
+                expect_match,
+                result
+            );
+        }
+
+        // Domain rule with port=443 still works
+        assert_eq!(
+            mgr.match_outbound(&Metadata::new(Address::domain("t.me", 443))),
+            Some("proxy".to_string())
+        );
+        // Domain rule does NOT match port 80
+        assert_eq!(
+            mgr.match_outbound(&Metadata::new(Address::domain("t.me", 80))),
+            None
         );
     }
 
