@@ -333,6 +333,17 @@ impl ProxyProtocol for HttpProtocol {
 
         // Parse destination
         let address = request.destination()?;
+
+        // Reject unspecified addresses (e.g. [::]:443 or 0.0.0.0:port from Android)
+        if let Some(addr) = address.as_socket() {
+            if addr.ip().is_unspecified() {
+                return Err(Error::Protocol(format!(
+                    "Rejecting unspecified destination: {}",
+                    address
+                )));
+            }
+        }
+
         let mut stream = reader.into_inner();
 
         // Mode-specific handling - both return (Metadata, Stream)
